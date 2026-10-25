@@ -397,6 +397,24 @@ func CodexListed() []catalog.Model {
 	}, false)
 }
 
+// CodexOwnModel is the provider and the model a bare id naming one of
+// Codex's own models reaches: the ChatGPT account's own model of that name
+// (CodexOwn), the account Codex means by the name. A Codex that asks for
+// gpt-6.1-sol — the Codex app's picker does, by the name the ChatGPT
+// backend lists it under — means that model, not another provider's model
+// of the same name.
+func CodexOwnModel(id string) (Provider, string, bool) {
+	if id == "" || strings.Contains(id, "/") {
+		return Provider{}, "", false
+	}
+	for _, e := range providerEntries() {
+		if e.Group == "" && CodexOwn(e) && strings.EqualFold(e.Model, id) {
+			return e.Provider, e.Model, true
+		}
+	}
+	return Provider{}, "", false
+}
+
 // CodexCatalog is shown as a Codex that names magpie its model_provider is
 // handed it from GET /v1/codex/models (#1281): every model, a ChatGPT
 // account's own among them, since that Codex reaches them through magpie's

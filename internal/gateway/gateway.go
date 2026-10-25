@@ -1721,6 +1721,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// the group's, as "group/<id>" is, rather than one provider's that
 	// serves it: the Routing view shows the group it went to
 	asked = call.Model
+	// A Codex asking for one of its own models by its bare name — the
+	// Codex app's picker does, by the name the ChatGPT backend lists it
+	// under — means that model: the ChatGPT account in magpie serves it,
+	// not another provider's model of the same name (Resolve would give it
+	// to the first one serving it) nor the routing group magpie found for
+	// the two. The account's own id names it, as CodexPath's own
+	// (codexAccounts) does.
+	if fromCodex(r.Header) || agent == "codex" {
+		if own, m, ok := provider.CodexOwnModel(asked); ok {
+			asked = own.ID + "/" + m
+		}
+	}
 	if agent == "claude-desktop" {
 		sub, _ := subagentOf(r.Header)
 		asked = desktopTurn(asked, body, fromClaudeCode(r.Header), sub != "")

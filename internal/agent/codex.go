@@ -270,7 +270,13 @@ func codexIn(at place) *Agent {
 	// Each model's default effort is the one this config starts new
 	// sessions at, or the model's nearest (codexcat.ModelDefault), which
 	// Codex takes on a switch to it.
-	list := func() []byte { return codexcat.CatalogAt(magpieModels("codex"), get("model_reasoning_effort")) }
+	// The list magpie writes for Codex holds Codex's own models by their
+	// bare names (the names the Codex app's picker asks for) and magpie's
+	// own, as provider/model: a catalog without them leaves the app with
+	// none of Codex's own models to pick.
+	list := func() []byte {
+		return codexcat.CatalogAt(append(catalog.Codex(), magpieModels("codex")...), get("model_reasoning_effort"))
+	}
 	ownList := func() []byte {
 		cur, _ := edit.Read(catalogPath)
 		return codexcat.Keep(cur, list())
@@ -386,9 +392,10 @@ func codexIn(at place) *Agent {
 	}
 	models := func() []catalog.Model {
 		switch {
-		case asProvider():
-			return magpieModels("codex")
-		case viaBase():
+		case asProvider(), viaBase():
+			// Codex's own models are in the list either way: as magpie's
+			// provider, the Codex app's picker asks for them by their bare
+			// names, and the catalog magpie writes for it holds them.
 			return append(catalog.Codex(), magpieModels("codex")...)
 		}
 		return catalog.Codex()
@@ -459,6 +466,13 @@ func codexIn(at place) *Agent {
 		}
 		return tok
 	}
+	// account: the user wants the Codex app to keep the ChatGPT account
+	// while magpie is its provider: the account's plan and its credit
+	// balance show in the app. A provider Codex reads as one that
+	// needs OpenAI auth keeps the account the app-server reports; one that
+	// does not leaves the app in its API state, with no account and no
+	// balance to show.
+	account := func() bool { return stashLoad()[at.key("codex.login")] == "account" }
 	putProvider := func() error {
 		kvs := []edit.KV{
 			{Path: "name", Value: "magpie"},
@@ -483,6 +497,13 @@ func codexIn(at place) *Agent {
 		// compaction's, aren't lost as it is written again
 		if caps := codexProviderCaps(path); caps != nil {
 			kvs = append(kvs, edit.KV{Path: "capabilities", Value: caps})
+		}
+		// the ChatGPT account the Codex app shows: a provider Codex reads
+		// as one that needs OpenAI auth keeps the account its app-server
+		// reports (its plan, its credit balance); one that does
+		// not leaves the app in its API state, with neither.
+		if account() {
+			kvs = append(kvs, edit.KV{Path: "requires_openai_auth", Value: "true"})
 		}
 		if err := edit.SetTOMLTable(path, "model_providers."+magpieID, kvs...); err != nil {
 			return err
@@ -1657,11 +1678,16 @@ func codexIn(at place) *Agent {
 				// no token for a provider without requires_openai_auth, so
 				// its Chrome control needs ChatGPT; the api note says so
 				// (#1824). Kept in the stash, where set("") leaves it.
+				// The account mode keeps the account the app-server
+				// reports, so the app shows the plan and the credit
+				// balance: the app greys its Send while the account is out
+				// of allowance and holds no credits, for that is what it
+				// does with an account it knows.
 				Key: "login", Label: "sign-in", Quiet: true,
 				Get: func() string { return stashLoad()[at.key("codex.login")] },
 				Set: func(v string) error {
-					if v != "" && v != "api" && v != "chatgpt" {
-						return fmt.Errorf("sign-in is api, chatgpt or empty (ChatGPT), not %q", v)
+					if v != "" && v != "api" && v != "chatgpt" && v != "account" {
+						return fmt.Errorf("sign-in is api, chatgpt, account or empty (ChatGPT), not %q", v)
 					}
 					stash(map[string]string{at.key("codex.login"): v})
 					m := get("model")
@@ -1684,6 +1710,7 @@ func codexIn(at place) *Agent {
 						{Value: "", Label: "ChatGPT", Note: "magpie's models join Codex's own; Codex stays signed in to ChatGPT, and while the Codex app blocks its account (out of allowance, no credits left) magpie is Codex's provider, so the app still sends"},
 						{Value: "chatgpt", Label: "Always ChatGPT", Note: "as ChatGPT, and kept so while the Codex app blocks its account: magpie never becomes Codex's provider. The Codex app may then send nothing till the account has room; Codex CLI goes on through magpie"},
 						{Value: "api", Label: "magpie API", Note: "magpie is Codex's provider; the Codex app is in its API state, with magpie's models only. Codex's Chrome control needs the ChatGPT sign-in, so pick ChatGPT to keep it"},
+						{Value: "account", Label: "magpie API, account kept", Note: "magpie is Codex's provider and the Codex app keeps the ChatGPT account: its plan and its credit balance show, and its own models stay in the picker. The app greys its Send while the account is out of allowance and holds no credits, as it does for an account it knows. Open the app again for it to read the account"},
 					}
 				},
 			},

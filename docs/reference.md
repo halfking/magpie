@@ -2259,7 +2259,8 @@ from a WSL distro under NAT while magpie is shared on the network.
 
 **Codex** gets a `[model_providers.magpie]` table, `model_catalog_json`
 pointing at `~/.codex/magpie-models.json` (written from the catalog, so the
-models show in Codex's own list) and a valid `model`/`effort`; picking a
+models show in Codex's own list, beside Codex's own models under the names
+the ChatGPT backend lists them by) and a valid `model`/`effort`; picking a
 native model or disconnecting removes `model_provider` and the catalog. The
 `[model_providers.magpie]` table stays, so a thread started on magpie can
 still be opened. Codex won't load its config at all when `model_provider =
@@ -2274,6 +2275,12 @@ app sends nothing for a held account, so magpie steps in, and it steps
 back once the account has room again. A window at 100% with credits left
 doesn't count: Codex stays signed in and keeps sending on those. Your
 ChatGPT sign-in is never touched.
+The sign-in field has a fourth mode, *magpie API, account kept*: magpie is
+Codex's provider and the Codex app keeps the ChatGPT account, so its plan
+and its credit balance show in the app and its own models stay in the
+picker. The app greys its Send while that account is out of allowance and
+holds no credits, as it does for an account it knows — pick it when the
+account has room.
 Codex reads its model list at start-up, so restart it after a switch.
 
 **OpenCode, Pi, Crush** get a `magpie` provider entry and `magpie/provider/model`.

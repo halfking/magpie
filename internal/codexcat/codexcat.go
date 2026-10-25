@@ -197,7 +197,14 @@ func entriesAt(ms []catalog.Model, after int, effort string) []any {
 	work := settings.Load()
 	var entries []any
 	for i, m := range ms {
-		if raw, ok := own[strings.TrimPrefix(m.ID, "codex/")]; ok && strings.HasPrefix(m.ID, "codex/") {
+		// Codex's own model: the entry Codex has for it, under the id it is
+		// asked by — magpie's codex provider's ("codex/gpt-6.1-sol") or
+		// Codex's own ("gpt-6.1-sol"), the name the Codex app's picker
+		// asks for. Without it, a model the catalog holds only under a
+		// provider's name is unknown to the app: it reads "Unknown model
+		// gpt-6.1-sol is used" and its picker has none of Codex's own
+		// models.
+		if raw, ok := own[strings.TrimPrefix(m.ID, "codex/")]; ok && (strings.HasPrefix(m.ID, "codex/") || !strings.Contains(m.ID, "/")) {
 			e := ownEntry(raw, m.ID, m.Name, after+i+1)
 			// the window as magpie resolves it — the one the user set,
 			// else the account's list's — not the cache's, which is what

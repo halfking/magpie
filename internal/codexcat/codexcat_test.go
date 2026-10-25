@@ -51,6 +51,44 @@ func TestCodexCatalogKeepsOwnEntries(t *testing.T) {
 	}
 }
 
+// Codex's own model under its own name — the name the ChatGPT backend
+// lists it under, and the one the Codex app's picker asks for — keeps the
+// entry Codex has for it, as the one under magpie's codex provider's name
+// does: without it, the app reads "Unknown model gpt-5.5 is used" and its
+// picker has none of Codex's own models.
+func TestCodexCatalogKeepsOwnEntryUnderItsOwnName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
+	os.WriteFile(filepath.Join(home, ".codex", "models_cache.json"), []byte(`{"models":[
+		{"slug":"gpt-5.5","display_name":"GPT-5.5","priority":3,"visibility":"list","input_modalities":["text","image"],
+		 "context_window":272000}]}`), 0o644)
+
+	var got struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(Catalog([]catalog.Model{
+		{ID: "gpt-5.5", Name: "GPT-5.5", Efforts: []string{"low", "high"}},
+	}), &got); err != nil || len(got.Models) != 1 {
+		t.Fatalf("%v %v", err, got)
+	}
+	own := got.Models[0]
+	if own["slug"] != "gpt-5.5" {
+		t.Fatalf("slug: %v", own["slug"])
+	}
+	// what Codex knows of it, not the generic entry
+	if own["context_window"] != float64(272000) {
+		t.Errorf("context_window: %v", own["context_window"])
+	}
+	if mods, _ := own["input_modalities"].([]any); len(mods) != 2 {
+		t.Errorf("input_modalities: %v", own["input_modalities"])
+	}
+	if desc, _ := own["description"].(string); strings.Contains(desc, "via magpie") {
+		t.Errorf("described as one of magpie's: %q", desc)
+	}
+}
+
 // A model that takes images says so, and Codex lets images be attached.
 func TestCodexCatalogImages(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

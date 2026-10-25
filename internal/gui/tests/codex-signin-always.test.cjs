@@ -1,9 +1,12 @@
 // Run with Node's test runner and Playwright on the module path; see README.md.
-// Codex's sign-in has three ways: ChatGPT (the default), which says that
+// Codex's sign-in has four ways: ChatGPT (the default), which says that
 // magpie is Codex's provider while the Codex app blocks the ChatGPT account
 // (out of allowance, no credits left), so the app still sends; Always
-// ChatGPT, which never does that and says what it costs; and magpie API,
-// which says Codex's Chrome control needs the ChatGPT sign-in (#1824).
+// ChatGPT, which never does that and says what it costs; magpie API,
+// which says Codex's Chrome control needs the ChatGPT sign-in (#1824); and
+// magpie API, account kept, which keeps the ChatGPT account so the app
+// shows its plan and its credit balance, at the price of a greyed Send
+// while the account is out of allowance and holds no credits.
 // The square opens the app's picker with each way's sentence whole, in
 // the page's language; Always ChatGPT is posted as "chatgpt" and lights the
 // square, ChatGPT posts "" again. A click scrolls nothing. At 1100px and
@@ -22,6 +25,7 @@ const ways = [
   { value: "", label: "ChatGPT", note: "magpie's models join Codex's own; Codex stays signed in to ChatGPT, and while the Codex app blocks its account (out of allowance, no credits left) magpie is Codex's provider, so the app still sends" },
   { value: "chatgpt", label: "Always ChatGPT", note: "as ChatGPT, and kept so while the Codex app blocks its account: magpie never becomes Codex's provider. The Codex app may then send nothing till the account has room; Codex CLI goes on through magpie" },
   { value: "api", label: "magpie API", note: "magpie is Codex's provider; the Codex app is in its API state, with magpie's models only. Codex's Chrome control needs the ChatGPT sign-in, so pick ChatGPT to keep it" },
+  { value: "account", label: "magpie API, account kept", note: "magpie is Codex's provider and the Codex app keeps the ChatGPT account: its plan and its credit balance show, and its own models stay in the picker. The app greys its Send while the account is out of allowance and holds no credits, as it does for an account it knows. Open the app again for it to read the account" },
 ];
 const fresh = () => ({
   agents: [{
@@ -86,6 +90,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const words = await page.evaluate(([ways, lang]) => ways.map((w) => lang === "en" ? [w.label, w.note] : [I18N[lang][w.label] || w.label, I18N[lang][w.note]]), [ways, lang]);
         assert(words.every(([, n]) => n), `every sentence has its ${lang}`);
         assert.match(words[2][1], /Chrome.*ChatGPT/, `magpie API says Chrome control needs ChatGPT in ${lang}`);
+        assert.equal(words[3][0] === "magpie API, account kept", lang === "en", `"magpie API, account kept" has its ${lang}`);
         assert.equal(words[1][0] === "Always ChatGPT", lang === "en", `"Always ChatGPT" has its ${lang}`);
         await page.locator(`${codex} .ag-link`).click();
         await page.locator(`${codex} .ag-exp`).waitFor();
