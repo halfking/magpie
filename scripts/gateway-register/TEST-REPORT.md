@@ -66,3 +66,45 @@ export MAGPIE_CONFIG_DIR=~/workspace/ai/magpie/.deployment-validation/config/mag
 python3 scripts/gateway-register/magpie_gateway_register.py all --probe-wait 5
 # 绑定 500 时: scripts/gateway-register/bind-via-ssh.sh <credential_id> "zcode/GLM-5.3,glm-5.3" ...
 ```
+
+## 2026-11-06 第二轮：Maestro 黑盒 + 多环境部署
+
+代码：HEAD 13ac949d（本报告路径修正后的下一提交）。新增
+[tests/maestro](../../tests/maestro/README.md)：Maestro WEB（CDP Chrome）驱动
+magpie 页与管理端页的黑盒套件，5 flow 全绿（m1 供应商 / m2 用量 / m3 网关 /
+g1 管理端列表过滤出行 / g2 详情页 base_url+凭据）。
+
+本机节点（niuerdeMacBook-Pro，192.168.31.30:3425）：`magpie web` 便携实例，
+ZCode 从 ~/.zcode 自动发现（GLM Coding Max），网关 key `211-gateway`，
+注册为 **provider 95436 / credential 99030**（registration:auto，5 模型绑定，
+网关 discovery 自动补齐）。E2E：第三方 key 经 llm.itestu.cn 调
+glm-5.3-flash → 200。新 provider 需 `PATCH /api/routing/emergency-repair`
+force_enable 才立即可路由（URSM 启动快照）。
+
+.36 XUTAOdeMacBook-Pro（192.168.31.36:3426，即第一轮的 .35 节点，IP 漂移）：
+serve 实例（LaunchAgent com.magpie.codex-validation）换上 49fd3e47 构建，
+:3426 → 200。注册脚本幂等收敛 provider 95357：base_url
+.35→.36 PATCH 200（IP 漂移自愈实测）；新凭据 99031（discovery 自动绑定）；
+99025/99031 并发都收敛到 3（fp_slot_limit 同改），99025 reset-state +
+99031 force_enable。magpie 侧 lane：zcode 3、zcode-pool 三账号各 3、
+队列 1×15s。quota snapshot PATCH 进 95357 notes（200）。
+**归属验证**：`glm-5.3-flash-trial`（magpie 独占，rank1=95357）经网关 →
+200 `NODE36-E2E-OK`，95357 用量 235→236。注意 glm-5.3-flash 的常规路由
+rank1 是 NVIDIA NIM 等直连供应商，magpie 排在其后——钉流量要么用 magpie
+独占模型名，要么临时 model-toggle 直连凭据。
+.36 桌面 app（/Applications/magpie.app，:3425）**保持原版本**：macOS 26
+对 LaunchAgent 二进制有 Launch Constraint（首启签名入缓存），换二进制后
+SIGKILL (Code Signature Invalid / Launch Constraint Violation)，ad-hoc 重签
+也过不了；已恢复原签名二进制并 bootstrap 复原（:3425 → 200）。49fd3e47 相比
+原 60b3ac53 只有 scripts/docs 差异，桌面 app 无需更新。
+
+.36 上跑注册的写法（在本机跑，覆盖身份避免撞 code）：
+`MAGPIE_REGISTER_HOSTNAME=XUTAOdeMacBook-Pro.local MAGPIE_REGISTER_IP=192.168.31.36
+--code magpie-zcode --magpie http://192.168.31.36:3426`；quota 子命令的
+--magpie-config-dir 要指到含 quotas.json 的 **magpie 目录本身**。
+
+.19（192.168.31.19，lanzheng）：**部署被阻**。机器是 Windows（IIS/10.0 +
+SMB/RPC），22/5985/5986 全关，445 的 SMB 用提供的 lanzheng 账号登录返回
+STATUS_LOGON_FAILURE（含大小写/域变体）。windows/amd64 部署包已备好
+（magpie-windows-amd64.exe 49fd3e47），开通 SSH/WinRM 或给出可用凭据后按
+.36 流程重放。
