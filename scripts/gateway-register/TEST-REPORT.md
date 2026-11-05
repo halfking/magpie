@@ -2,7 +2,7 @@
 
 **日期**: 2026-11-05
 **测试环境**: macOS (Darwin/arm64, XUTAOdeMacBook-Pro) / magpie serve 实例 :3426 / 网关 llm.itestu.cn (211 容器 llm-gateway-211-a:8781)
-**脚本**: `.deployment-validation/gateway-register/magpie_gateway_register.py`（纯 Python 标准库，跨平台）
+**脚本**: `scripts/gateway-register/magpie_gateway_register.py`（纯 Python 标准库，跨平台）
 
 ## 验证结论总览
 
@@ -62,7 +62,7 @@
 export LLM_GATEWAY_SECRET=<211/252 网关 LLM_GATEWAY_SECRET_KEY>
 export LLM_GATEWAY_TEST_KEY=<envs SSOT projects/llm-gateway-go/.env.secrets.plain.yaml>
 export MAGPIE_CALLER_KEY=<magpie 3426 caller key>
-export MAGPIE_CONFIG_DIR=~workspace/ai/magpie/.deployment-validation/config/magpie
-python3 magpie_gateway_register.py all --probe-wait 5
-# 绑定 500 时: ./bind-via-ssh.sh <credential_id> "zcode/GLM-5.3,glm-5.3" ...
+export MAGPIE_CONFIG_DIR=~/workspace/ai/magpie/.deployment-validation/config/magpie
+python3 scripts/gateway-register/magpie_gateway_register.py all --probe-wait 5
+# 绑定 500 时: scripts/gateway-register/bind-via-ssh.sh <credential_id> "zcode/GLM-5.3,glm-5.3" ...
 ```
