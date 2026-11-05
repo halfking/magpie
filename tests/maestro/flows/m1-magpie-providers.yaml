@@ -1,0 +1,20 @@
+# m1 — magpie web 的「供应商」页：ZCode 订阅被 magpie 发现并作为供应商提供模型
+# 这是自动注册链路的源头：magpie 从本机 agent 登录态发现订阅，/v1/models 才有
+# 独有模型，网关注册才有东西可绑。
+url: ${MAGPIE_URL}
+---
+# launchApp 打开 config url 指向的 web 页（web flow 不会自动导航）
+- launchApp
+- extendedWaitUntil:
+    visible: '供应商'
+    timeout: 30000
+- tapOn: '供应商'
+- extendedWaitUntil:
+    # 供应商卡片：ZCode 已登录，5 个模型。Maestro 的 text 是全匹配 textRegex，
+    # 节点全文是「已登录 ZCode · 5 个模型」⇒ 用 .* 收尾才能命中
+    visible: '已登录 ZCode.*'
+    timeout: 20000
+- extendedWaitUntil:
+    visible: 'GLM Coding Max'
+    timeout: 10000
+- takeScreenshot: m1-providers

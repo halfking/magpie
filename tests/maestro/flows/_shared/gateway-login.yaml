@@ -1,0 +1,30 @@
+# 共享登录流 —— g1/g2 都用 runFlow 调它（每个 maestro test 进程是独立会话，
+# 登录态不跨 flow 复用，所以每个 flow 自己登录）。
+# 控件与坑位说明见 llm-gateway-go 仓 maestro/flows/_shared/login.yaml（同一家网关）：
+#   - 用户名框预填 admin，inputText 是追加 ⇒ 先 eraseText
+#   - 提交用 pressKey Enter，避开页面上多处「登录」文案的 tapOn 歧义
+#   - 连续登录失败会触发验证码闸门（admin/auth_captcha.go），那种状态先清失败计数
+url: ${GATEWAY_URL}
+---
+- openLink: ${GATEWAY_URL}/login
+- extendedWaitUntil:
+    visible:
+      id: "login-modal-title"
+    timeout: 20000
+- tapOn:
+    id: "login-username"
+- eraseText: 20
+- inputText:
+    id: "login-username"
+    text: "${GATEWAY_ADMIN_USER}"
+- tapOn:
+    id: "login-password"
+- eraseText: 40
+- inputText:
+    id: "login-password"
+    text: "${GATEWAY_ADMIN_PASSWORD}"
+- pressKey: Enter
+- extendedWaitUntil:
+    notVisible:
+      id: "login-modal-title"
+    timeout: 20000

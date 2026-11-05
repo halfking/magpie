@@ -1,0 +1,22 @@
+# m3 — magpie web 的「网关」页：网关运行、共享密钥存在、独有模型挂在网关上
+# 这是链路的出口侧：网关地址 + 密钥就是注册脚本 --magpie-caller-key 的载体。
+url: ${MAGPIE_URL}
+---
+- launchApp
+- extendedWaitUntil:
+    visible: '网关'
+    timeout: 30000
+- tapOn: '网关'
+- extendedWaitUntil:
+    # 页首状态是「网关」+ 子节点「运行中」两个文本节点（IAB 快照里才合成一个）
+    visible: '运行中'
+    timeout: 20000
+- extendedWaitUntil:
+    # 为本测试实例建的共享密钥名
+    visible: '211-gateway'
+    timeout: 10000
+- extendedWaitUntil:
+    # 独有模型以 provider/model 形式挂在网关页的模型列表里
+    visible: 'zcode/GLM-5.3'
+    timeout: 10000
+- takeScreenshot: m3-gateway

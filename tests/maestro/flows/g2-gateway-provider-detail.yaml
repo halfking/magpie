@@ -1,0 +1,23 @@
+# g2 — llm.itestu.cn 管理端：自动注册 provider 的详情页
+# 详情页默认页签渲染「基础信息 / Basic info」（语言随浏览器），断言一律用
+# 与语言无关的取值：provider 显示名、base_url、凭据 label。
+url: ${GATEWAY_URL}
+---
+- runFlow:
+    file: _shared/gateway-login.yaml
+    env:
+      GATEWAY_URL: ${GATEWAY_URL}
+      GATEWAY_ADMIN_USER: ${GATEWAY_ADMIN_USER}
+      GATEWAY_ADMIN_PASSWORD: ${GATEWAY_ADMIN_PASSWORD}
+- openLink: ${GATEWAY_URL}/providers/${GATEWAY_PROVIDER_ID}
+- extendedWaitUntil:
+    visible: 'magpie @ ${GATEWAY_MAGPIE_HOST}.*'
+    timeout: 30000
+- extendedWaitUntil:
+    visible: 'http://${GATEWAY_MAGPIE_BASE}/v1'
+    timeout: 15000
+- extendedWaitUntil:
+    # 注册脚本默认的凭据 label（--cred-label 的默认值）
+    visible: 'magpie-serve'
+    timeout: 15000
+- takeScreenshot: g2-provider-detail

@@ -1,0 +1,25 @@
+# g1 — llm.itestu.cn 管理端：供应商列表里出现自动注册的 magpie 节点
+# 列表 800+ 行按名称排序，magpie 行在很后面 ⇒ 用过滤栏的搜索框（占位文案
+# 「搜索显示名…」，无 id）过滤后再断言行。
+# Maestro 的 text 是全匹配 textRegex：值当正则编译 ⇒ 断言值别带括号等元字符。
+url: ${GATEWAY_URL}
+---
+- runFlow:
+    file: _shared/gateway-login.yaml
+    env:
+      GATEWAY_URL: ${GATEWAY_URL}
+      GATEWAY_ADMIN_USER: ${GATEWAY_ADMIN_USER}
+      GATEWAY_ADMIN_PASSWORD: ${GATEWAY_ADMIN_PASSWORD}
+- openLink: ${GATEWAY_URL}/providers
+- extendedWaitUntil:
+    visible: '供应商管理'
+    timeout: 30000
+- tapOn: '搜索显示名.*'
+- inputText: 'magpie'
+- extendedWaitUntil:
+    # 自动注册的 provider 行：display_name 由注册脚本生成，与语言无关。
+    # runner 用 --screen-size 1280x2000 的大视口：过滤后整行都在视口内，
+    # 不需要滚动（表格有自己的滚动容器，页面级滚动到不了它）。
+    visible: 'magpie @ ${GATEWAY_MAGPIE_HOST}.*'
+    timeout: 20000
+- takeScreenshot: g1-providers

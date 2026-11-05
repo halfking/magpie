@@ -1,0 +1,21 @@
+# m2 — magpie web 的「用量」页：start plan 的 5 小时/每周窗口卡片与余量走势可见
+# 对应 scripts/gateway-register 里 quota 同步的数据源：Usage 页展示的窗口
+# 就是 quotas.json → 网关 provider notes 的 quota_snapshot 的来源。
+url: ${MAGPIE_URL}
+---
+- launchApp
+- extendedWaitUntil:
+    visible: '用量'
+    timeout: 30000
+- tapOn: '用量'
+- extendedWaitUntil:
+    # start plan 的两个窗口卡片（百分比随时变，断言窗口名与走势图标题）
+    visible: '5 小时'
+    timeout: 20000
+- extendedWaitUntil:
+    visible: '每周'
+    timeout: 10000
+- extendedWaitUntil:
+    visible: '剩余额度走势'
+    timeout: 10000
+- takeScreenshot: m2-usage
