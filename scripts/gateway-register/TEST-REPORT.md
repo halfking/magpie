@@ -289,7 +289,11 @@ registration=auto、magpie_port=3425。
 
 **Maestro**：5 flow 全绿（m1/m2/m3 + g1/g2），报告
 `tests/maestro/reports/20261107-005906/`；最终 head（801b258a，Go 树与部署
-二进制完全一致，diff 为空）上复跑再绿一轮：`reports/20261107-010540/`。
+二进制完全一致，diff 为空）上复跑再绿一轮：`reports/20261107-010540/`；
+与 origin be870f2be（上游 v0.1.3189 同步）合并后的最终 head（95a758d6f）重建
+重部署后再绿一轮：`reports/20261107-011225/`，glm-5.3 e2e 200 `FINAL-HEAD-OK`。
+（合并前后 `gofmt -l` 全净、`go build ./...` ok；上游未触碰
+skillgit_test.go，第六轮的 gofmt 修复保持。）
 
 **本轮新建网关数据面 key**：id 230 `magpie-round6-e2e`（app e2e-magpie-test）
 ——key 列表不回显既有值，沿用往轮建一次性 key 的做法（229 `magpie-e2e-test`
