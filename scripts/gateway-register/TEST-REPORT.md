@@ -373,8 +373,11 @@ trial 周末桶 21.5M/500M）。
 - 绑定 API 42P08（$8 无 cast）依旧，SQL fallback 可用。
 
 **Maestro 黑盒（tests/maestro，本机 Windows 首跑）**：5 flow 全绿
-（m1 供应商 / m2 用量 / m3 网关 / g1 管理端列表 / g2 详情页）。Windows 适配
-与修复：
+（m1 供应商 / m2 用量 / m3 网关 / g1 管理端列表 / g2 详情页）。
+变基落位后（ca3e57f94+本提交=4cf1ff929）在推送头重建的节点上**复跑
+5/5 全绿**（reports/20261107-023028，EXIT=0）；注册/路由/直连 trial 出活
+同点复验（95464 enabled、registration=auto、resolve 含 95464 双凭据）。
+Windows 适配与修复：
 - `--driver-host-port` 在 Windows 不可用：maestro 对该端口做 **ServerSocket
   试绑探测**，Chrome 占 127.0.0.1:9222 时 wildcard 绑定 EADDRINUSE（macOS 靠
   SO_REUSEADDR 放行，Java 在 Windows 不开）。run-local.sh 默认不传该参数
