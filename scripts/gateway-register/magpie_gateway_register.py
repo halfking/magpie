@@ -239,13 +239,18 @@ def cmd_register(args):
         pid = existing["id"]
         log("provider exists: id=%s code=%s (幂等: 重复注册收敛为 PATCH)" % (pid, code))
         evidence("REGISTER_MODE", "idempotent-patch")
+        # display_name 里嵌了注册时的 IP，漂移后一起收敛
+        patch = {"notes": notes}
+        if (existing.get("display_name") or "") != payload["display_name"]:
+            patch["display_name"] = payload["display_name"]
         cur_url = existing.get("base_url") or ""
         if cur_url != base_url:
-            st, body = gw.api("PATCH", "/api/providers/%s" % pid, {"base_url": base_url, "notes": notes})
+            patch["base_url"] = base_url
+            st, body = gw.api("PATCH", "/api/providers/%s" % pid, patch)
             log("base_url drift %s → %s : PATCH %s" % (cur_url, base_url, st))
         else:
-            log("base_url 已一致 (%s)，仅刷新 notes" % base_url)
-            st, body = gw.api("PATCH", "/api/providers/%s" % pid, {"notes": notes})
+            log("base_url 已一致 (%s)，刷新 notes/display_name" % base_url)
+            st, body = gw.api("PATCH", "/api/providers/%s" % pid, patch)
         evidence("PROVIDER_ID", pid)
     else:
         st, body = gw.api("POST", "/api/providers", payload)

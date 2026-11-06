@@ -108,3 +108,47 @@ SMB/RPC），22/5985/5986 全关，445 的 SMB 用提供的 lanzheng 账号登�
 STATUS_LOGON_FAILURE（含大小写/域变体）。windows/amd64 部署包已备好
 （magpie-windows-amd64.exe 49fd3e47），开通 SSH/WinRM 或给出可用凭据后按
 .36 流程重放。
+
+##2026-11-06 第三轮：审计、修复与5d3c6464 重部署
+
+合并 5d3c6464 后对四项需求复审计（HEAD 无 Go 源码差异，仅 docs/tests），
+发现并修掉三处；.36 实例换上 5d3c6464 构建（v0.1.1480，LaunchAgent 重启），
+复跑 register/e2e/quota/usage 全绿。
+
+**修复1 — register 幂等路径收敛 display_name**（magpie_gateway_register.py）：
+幂等 PATCH 原本只收敛 base_url/notes，IP 漂移后 display_name 里嵌的旧 IP
+不动（95433 一直显示 `.35`）。现在 display_name 一并比对、变化即 PATCH。
+复跑：95433 display_name → `magpie @ XUTAOdeMacBook-Pro.local (192.168.31.36)`。
+
+**修复2 — 凭据 99027 `availability_auth_failed`**：网关探针打
+`192.168.31.36:3426/v1/models` 401——99027 密文里存的 caller key 与实例
+现值不符（重建实例时换过 key）。用
+`POST /api/providers/{pid}/credentials/{cid}/rotate-primary-key`
+（`{"api_key":[REDACTED:secret]"} → 202 probe queued）轮转成当前 key；
+退避窗口过后探针 200，`availability_state: auth_failed → ready`。
+
+**修复3 — 凭据 99030 trial 绑定 outbound_model_name 为空**：网关出站发标准化名
+`glm-5.3-flash-trial`，magpie 404。SQL 补
+`outbound_model_name='zcode/GLM-5.3-Flash-Trial'`（99027 是注册脚本写的、
+本来就对）。同轮把 95357（`.35` 时代的旧注册，凭据 suspended/exhausted 但
+resolver 仍排 rank1）`PATCH /api/providers/95357 {"enabled":false}` 摘出路由，
+trial 候选收敛为 95433/95436 两个活凭据。
+
+**`glm-5.3-flash-trial` 当前 503 的残余根因是上游**：magpie 返回
+`ZCode has no active limited quota for GLM-5.3-Flash-Trial`——Start Plan
+夜间桶（23:00–09:00）白天不放量，路由/凭据/绑定链路已全部就绪，夜间窗口
+自动出活。白天时段独占模型验证用 `glm-5.3`（只有 magpie 可路由）：
+E2E 200 `FINAL-AUDIT-OK`。
+
+**修复4（复发坑）—rotate/refresh 再次放大绑定**：99027 的绑定在 rotate 后
+被 discovery 刷回 266 个全量（models refresh 同坑的第二处复发），非 GLM 流量打进
+magpie 吃上游错→凭据熔断连带 glm。SQL 收窄回 5 个 zcode GLM（DELETE 261），
+99030 本来就是 5 个；clear_circuit 后 glm-5.3 / glm-5.3-flash E2E 复跑均 200。
+**rotate-primary-key也会触发绑定 refresh**——rotate完要复查绑定数量。
+
+**复审计结论（2026-11-06 上午）**：需求1✅（266 模型、GLM-5.3-Flash/5.2/5.3
+直连出活）；需求2✅（idempotent-patch + IP/display_name 自愈 +265 模型
+检索）；需求3✅（第三方 key 经 llm.itestu.cn：glm-5.3 / glm-5.3-flash 均
+200）；需求4✅（quota patch-200；usage 200/200）。
+`.36` 重部署证据：`go version -m` → `v0.1.1480-…-5d3c646442ee`，:3426 → 200，
+新二进制 LaunchAgent（serve）无 Launch Constraint 问题（非 GUI app）。
