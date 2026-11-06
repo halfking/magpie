@@ -91,9 +91,12 @@ find_chrome() {
 CHROME_BIN="$(find_chrome)"
 [ -n "${CHROME_BIN}" ] || { echo "!! 找不到 Chrome（设 MAESTRO_CHROME_BIN）" >&2; exit 2; }
 
+# curl 一律 --noproxy '*'：clash verge 这类代理软件把 http_proxy 塞进 shell 时，
+# 探测 127.0.0.1:9222 的请求会被交给代理而打不到本机 CDP（本地端口"无法访问"的
+# 典型原因），CDP 探测必须直连。
 CHROME_PROFILE="${MAESTRO_CHROME_PROFILE:-/tmp/maestro-magpie-chrome-profile}"
 CHROME_PID=""
-if ! curl -s --max-time 3 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/null 2>&1; then
+if ! curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/null 2>&1; then
   echo "== 自起 Chrome（CDP :${DRIVER_PORT}，zh-CN）"
   mkdir -p "${CHROME_PROFILE}"
   nohup "${CHROME_BIN}" \
@@ -105,10 +108,10 @@ if ! curl -s --max-time 3 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/n
     about:blank >"${REPORT_ROOT}/.chrome.log" 2>&1 &
   CHROME_PID=$!
   for _ in $(seq 1 30); do
-    curl -s --max-time 2 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/null 2>&1 && break
+    curl -s --noproxy '*' --max-time 2 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/null 2>&1 && break
     sleep 1
   done
-  curl -s --max-time 3 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/null 2>&1 \
+  curl -s --noproxy '*' --max-time 3 "http://127.0.0.1:${DRIVER_PORT}/json/version" >/dev/null 2>&1 \
     || { echo "!! Chrome 起不来（看 ${REPORT_ROOT}/.chrome.log）" >&2; exit 2; }
 fi
 # 脚本退出时收掉自己起的 Chrome——测试启动的东西随测试结束结束

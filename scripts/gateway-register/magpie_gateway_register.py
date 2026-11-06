@@ -41,30 +41,41 @@ DEFAULT_CONTEXT_WINDOW = 128000
 RECORD = []  # 测试证据行
 #2026-11-06 桶语义：trial（Start Plan 夜间桶）上游并发上限 3，与常规 serve
 #池不同，拆成独立凭据让网关按凭据限流——trial 满时 STD 不被连坐排队。
+#（trial 绑定的标准化名由 bind_models 按 raw 名小写取尾段得出。）
 TRIAL_RAW = "zcode/GLM-5.3-Flash-Trial"
-TRIAL_STD = "glm-5.3-flash-trial"
 TRIAL_CONCURRENCY = 3
+SECRETS = []  # 运行期收集的口令；log/evidence 输出前替换掉，key 不落终端/报告
+
+
+def scrub(msg):
+    for s in SECRETS:
+        if s:
+            msg = msg.replace(s, "[REDACTED]")
+    return msg
 
 
 def log(msg):
-    print(msg, flush=True)
+    print(scrub(msg), flush=True)
 
 
 def evidence(key, value):
     line = "VERIFY_%s=%s" % (key, value)
-    RECORD.append(line)
+    RECORD.append(scrub(line))
     log("[evidence] " + line)
 
 
 # ── 身份检测（跨平台）───────────────────────────────────────────────
-def detect_identity(gateway_host="llm.itestu.cn"):
+def detect_identity(gateway_url="https://llm.itestu.cn"):
     node = platform.node() or os.environ.get("COMPUTERNAME") or "unknown-host"
     host_override = os.environ.get("MAGPIE_REGISTER_HOSTNAME")  # 多平台测试时允许覆盖
     host = host_override or node
-    code = "magpie-" + host.lower().replace(".", "").replace(".local", "")[:40]
+    code = "magpie-" + host.lower().replace(".", "")[:40]
     ip = os.environ.get("MAGPIE_REGISTER_IP")
     if not ip:
-        ip = lan_ip(gateway_host, 443 if "https" else 8781) or "127.0.0.1"
+        u = urllib.parse.urlparse(gateway_url if "//" in gateway_url else "//" + gateway_url, scheme="https")
+        # UDP connect 只做路由探测，端口不参与结果；按网关 scheme 取对应端口
+        port = 443 if u.scheme == "https" else 8781
+        ip = lan_ip(u.hostname or gateway_url, port) or "127.0.0.1"
     return {
         "platform": "%s/%s" % (platform.system(), platform.machine()),
         "python": platform.python_version(),
@@ -75,6 +86,18 @@ def detect_identity(gateway_host="llm.itestu.cn"):
     }
 
 
+def _is_lan_ip(ip):
+    """注册约定（2026-11-05）：base_url 必须是 RFC1918 LAN IP。回环、链路本地
+    169.254/16、CGNAT 100.64/10（netbird，网关 egress 守卫会熔断）、fake-ip TUN
+    198.18/15（clash verge 这类代理软件的 TUN 常占着它，UDP connect 的出口地址
+    会变成 198.18.0.1）都不是，检测到它们等于没检测到。"""
+    a = str(ip or "").split(".")
+    if len(a) != 4 or not all(x.isdigit() and 0 <= int(x) <= 255 for x in a):
+        return False
+    n1, n2 = int(a[0]), int(a[1])
+    return n1 == 10 or (n1 == 172 and 16 <= n2 <= 31) or (n1 == 192 and n2 == 168)
+
+
 def lan_ip(host, port):
     """UDP connect 技巧取出口 IP；不通则回落本机地址枚举。跨平台。"""
     try:
@@ -83,7 +106,7 @@ def lan_ip(host, port):
         s.connect((host, port))
         ip = s.getsockname()[0]
         s.close()
-        if ip and not ip.startswith("127."):
+        if _is_lan_ip(ip):
             return ip
     except OSError:
         pass
@@ -91,7 +114,7 @@ def lan_ip(host, port):
         hostname = socket.gethostname()
         for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
             ip = info[4][0]
-            if ip.startswith(("192.168.", "10.", "172.")) :
+            if _is_lan_ip(ip):
                 return ip
     except OSError:
         pass
@@ -105,8 +128,17 @@ def http_json(method, url, body=None, headers=None, timeout=30):
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, method=method, data=data, headers=hdrs)
+    # clash verge 这类系统代理：shell 里有 http_proxy 时 urllib 会把 127.0.0.1 的
+    # 请求也交给代理，而代理回不到本机回环 → 502/超时（本机 magpie :3426 打不通
+    # 的典型原因）。回环目标一律直连。
+    host = (urllib.parse.urlparse(url).hostname or "")
+    opener = None
+    if host in ("localhost", "::1") or host.startswith("127."):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        r = (opener.open(req, timeout=timeout) if opener
+             else urllib.request.urlopen(req, timeout=timeout))
+        with r:
             raw = r.read().decode()
             return r.status, (json.loads(raw) if raw.strip() else {})
     except urllib.error.HTTPError as e:
@@ -138,16 +170,37 @@ def admin_jwt(secret, ttl=900):
 
 
 class Gateway:
-    def __init__(self, base, secret):
+    def __init__(self, base, secret=None, admin_user=None, admin_password=None):
         self.base = base.rstrip("/")
-        self.jwt = admin_jwt(secret)
+        if secret:
+            self.jwt = admin_jwt(secret)
+        elif admin_user and admin_password:
+            self.jwt = self._login_jwt(admin_user, admin_password)
+        else:
+            raise SystemExit("网关鉴权缺失：--secret（自签 super_admin JWT）或 "
+                             "--gateway-admin-user/--gateway-admin-password（登录换取）二者其一")
         self.h = {"Authorization": "Bearer " + self.jwt}
+
+    def _login_jwt(self, user, password):
+        """管理端登录换 token（admin/handler.go 的 /api/auth/token），与 UI/maestro 同路。"""
+        st, body = http_json("POST", self.base + "/api/auth/token",
+                             {"username": user, "password": password})
+        if st != 200 or not isinstance(body, dict):
+            raise SystemExit("网关登录失败（HTTP %s）：%s" % (st, str(body)[:160]))
+        tok = (body.get("access_token") or body.get("token")
+               or (body.get("data") or {}).get("access_token") or (body.get("data") or {}).get("token"))
+        if not tok:
+            raise SystemExit("网关登录响应里没有 token（HTTP %s）" % st)
+        return tok
 
     def api(self, method, path, body=None, timeout=30):
         return http_json(method, self.base + path, body, self.h, timeout)
 
     def providers(self):
         st, body = self.api("GET", "/api/providers")
+        # 非 200 时按空列表继续会误判 provider 不存在、进而误 POST，这里至少说一声
+        if st != 200:
+            log("GET /api/providers -> HTTP %s（鉴权或网关问题；下面按空列表处理）" % st)
         rows = body if isinstance(body, list) else body.get("providers") or body.get("data") or []
         return st, rows
 
@@ -207,7 +260,7 @@ def read_quotas(config_dir):
 
 # ── register ──────────────────────────────────────────────────────
 def cmd_register(args):
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    ident = detect_identity(args.gateway)
     evidence("PLATFORM", ident["platform"])
     evidence("HOSTNAME", ident["hostname"])
     evidence("LAN_IP", ident["ip"])
@@ -224,11 +277,21 @@ def cmd_register(args):
     want = unique or ([] if not models else DEFAULT_MODELS)
     if not want:
         log("magpie serves no models (HTTP %s, %d ids) — registering with no bindings" % (mst, len(models)))
-        evidence("BIND_MODELS", "none")
     log("magpie models: %d total, bind candidates: %s" % (len(models), want))
-    evidence("BIND_MODELS", ",".join(want))
+    evidence("BIND_MODELS", ",".join(want) or "none")
 
-    gw = Gateway(args.gateway, args.secret)
+    # base_url 守卫：自动检测到的地址必须是 RFC1918 LAN IP（注册约定 2026-11-05）。
+    # 回环、CGNAT、fake-ip TUN（198.18.0.1，clash verge 实测会这样）拿去当 base_url
+    # 都会让网关回源打到假地址——幂等路径更会把一个好好的 base_url PATCH 坏（本轮
+    # 就把 95436 的 base_url PATCH 成过 http://198.18.0.1:3426/v1，2026-11-07 修复）。
+    # 真有特殊地址用 MAGPIE_REGISTER_IP 显式声明（显式值是操作者自己的决定，不拦）。
+    if not os.environ.get("MAGPIE_REGISTER_IP") and not _is_lan_ip(ident["ip"]):
+        log("检测到的地址 %s 不是 RFC1918 LAN IP——拒绝以它注册/收敛 base_url"
+            "（网关回源会打到假地址）。用 MAGPIE_REGISTER_IP 显式指定本机对网关可达的地址后重跑。" % ident["ip"])
+        evidence("REGISTER_RESULT", "fail-non-lan-ip")
+        return 1
+
+    gw = Gateway(args.gateway, args.secret, args.gateway_admin_user, args.gateway_admin_password)
 
     # 1) 幂等注册 provider
     code = args.code or ident["code"]
@@ -297,6 +360,9 @@ def cmd_register(args):
     trial_cid = ensure_cred("magpie-trial", TRIAL_CONCURRENCY) if trial_models else None
     if cid is None and trial_cid is None:
         return 1
+    # 有凭据创建失败时继续把能绑的绑完（work 尽量做），但结论记 partial、退出非 0，
+    # 不再让末尾的 REGISTER_RESULT=ok 把 fail-cred 证据行盖掉
+    cred_failed = cid is None or (trial_models and trial_cid is None)
     if cid is not None:
         evidence("CREDENTIAL_ID", cid)
     if trial_cid is not None:
@@ -329,6 +395,10 @@ def cmd_register(args):
             all_live |= {b.get("standardized_name") or b.get("raw_model_name") for b in gw.bindings(pid, target)}
     evidence("BINDINGS_AFTER", ",".join(sorted(x for x in all_live if x)))
 
+    if cred_failed:
+        log("部分凭据创建失败（见上方 fail-cred 证据行）——REGISTER_RESULT 记 partial")
+        evidence("REGISTER_RESULT", "partial")
+        return 1
     evidence("REGISTER_RESULT", "ok")
     return 0
 
@@ -363,7 +433,7 @@ def cmd_e2e(args):
 
 def cmd_quota(args):
     """余量同步: magpie quotas.json → PATCH provider notes.quota_snapshot。"""
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    ident = detect_identity(args.gateway)
     q = read_quotas(args.magpie_config_dir)
     if q is None:
         log("quotas.json 不存在于 %s（用 --magpie-config-dir 指定 magpie 配置目录）" % args.magpie_config_dir)
@@ -376,9 +446,9 @@ def cmd_quota(args):
         for w in v["windows"]:
             if w.get("limit"):
                 log("  %s | %s: %s" % (acc, w["name"], w.get("display", "%s / %s" % (w.get("used"), w["limit"]))))
-    gw = Gateway(args.gateway, args.secret)
+    gw = Gateway(args.gateway, args.secret, args.gateway_admin_user, args.gateway_admin_password)
     code = args.code or ident["code"]
-    p = gw.find_by_code(code) or (gw.find_by_code("magpie-zcode") if gw.find_by_code("magpie-zcode") else None)
+    p = gw.find_by_code(code) or gw.find_by_code("magpie-zcode")
     if not p:
         log("provider 未注册（先跑 register）")
         evidence("QUOTA_SYNC", "no-provider")
@@ -397,8 +467,8 @@ def cmd_quota(args):
 
 def cmd_usage(args):
     """网关侧用量（请求经网关即自动记账）。"""
-    gw = Gateway(args.gateway, args.secret)
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    gw = Gateway(args.gateway, args.secret, args.gateway_admin_user, args.gateway_admin_password)
+    ident = detect_identity(args.gateway)
     code = args.code or ident["code"]
     p = gw.find_by_code(code)
     if not p:
@@ -416,8 +486,8 @@ def cmd_usage(args):
 def cmd_models(args):
     mst, models = magpie_models(args.magpie, args.magpie_caller_key)
     log("magpie HTTP %s, %d models" % (mst, len(models)))
-    gw = Gateway(args.gateway, args.secret)
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    gw = Gateway(args.gateway, args.secret, args.gateway_admin_user, args.gateway_admin_password)
+    ident = detect_identity(args.gateway)
     p = gw.find_by_code(args.code or ident["code"])
     if p:
         for c in gw.credentials(p["id"]):
@@ -449,6 +519,9 @@ def main():
     ap.add_argument("--gateway", default="https://llm.itestu.cn")
     ap.add_argument("--magpie", default="http://127.0.0.1:3426")
     ap.add_argument("--secret", default=os.environ.get("LLM_GATEWAY_SECRET"))
+    ap.add_argument("--gateway-admin-user", default=os.environ.get("LLM_GATEWAY_ADMIN_USER"),
+                    help="管理端登录账号（与 --gateway-admin-password 二选一路径：登录换 token，不必持有签名密钥）")
+    ap.add_argument("--gateway-admin-password", default=os.environ.get("LLM_GATEWAY_ADMIN_PASSWORD"))
     ap.add_argument("--test-key", default=os.environ.get("LLM_GATEWAY_TEST_KEY"))
     ap.add_argument("--magpie-caller-key", default=os.environ.get("MAGPIE_CALLER_KEY"))
     ap.add_argument("--magpie-config-dir", default=os.environ.get("MAGPIE_CONFIG_DIR"))
@@ -460,17 +533,24 @@ def main():
     ap.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW)
     ap.add_argument("--cred-label", default="magpie-serve")
     ap.add_argument("--serve-concurrency", type=int, default=3,
-                       help="serve credential concurrency (trial fixed at3)")
+                       help="serve credential concurrency (trial 固定 3)")
     ap.add_argument("--probe-wait", type=int, default=20)
     args = ap.parse_args()
 
+    SECRETS.extend(v for v in (args.secret, args.test_key, args.magpie_caller_key,
+                               args.gateway_admin_password) if v)
+
     if args.cmd == "identify":
-        log(json.dumps(detect_identity(urllib.parse.urlparse(args.gateway).hostname or ""), ensure_ascii=False))
+        log(json.dumps(detect_identity(args.gateway), ensure_ascii=False))
         return 0
     if not args.magpie_caller_key and args.cmd in ("register", "models", "all"):
         raise SystemExit("缺少 --magpie-caller-key / MAGPIE_CALLER_KEY")
-    if not args.secret and args.cmd in ("register", "quota", "usage", "models", "all"):
-        raise SystemExit("缺少 --secret / LLM_GATEWAY_SECRET")
+    has_auth = args.secret or (args.gateway_admin_user and args.gateway_admin_password)
+    if not has_auth and args.cmd in ("register", "quota", "usage", "models", "all"):
+        raise SystemExit("缺少网关鉴权：--secret / LLM_GATEWAY_SECRET，或 "
+                         "--gateway-admin-user + --gateway-admin-password（LLM_GATEWAY_ADMIN_USER/PASSWORD）")
+    if not args.test_key and args.cmd in ("e2e", "all"):
+        raise SystemExit("缺少 --test-key / LLM_GATEWAY_TEST_KEY")
     fn = {"models": cmd_models, "register": cmd_register, "e2e": cmd_e2e,
           "quota": cmd_quota, "usage": cmd_usage, "all": cmd_all}[args.cmd]
     return fn(args)
