@@ -60,7 +60,9 @@
 
 ```bash
 export LLM_GATEWAY_SECRET=<211/252 网关 LLM_GATEWAY_SECRET_KEY>
-export LLM_GATEWAY_TEST_KEY=<envs SSOT projects/llm-gateway-go/.env.secrets.plain.yaml>
+# 签名密钥不在手时用管理端登录换 token（第六轮起支持，与 UI/maestro 同路）：
+# export LLM_GATEWAY_ADMIN_USER=<管理端账号> LLM_GATEWAY_ADMIN_PASSWORD=<密码>
+export LLM_GATEWAY_TEST_KEY=<网关数据面 key（第三方视角）>
 export MAGPIE_CALLER_KEY=<magpie 3426 caller key>
 export MAGPIE_CONFIG_DIR=~/workspace/ai/magpie/.deployment-validation/config/magpie
 python3 scripts/gateway-register/magpie_gateway_register.py all --probe-wait 5
@@ -217,3 +219,89 @@ trial 绑定禁用（discovery 给新凭据秒灌265 模型——narrow 269 行�
 （`TRIAL_CONCURRENCY=3`，`--serve-concurrency` 可调），模型绑定按桶分组；
 同一台机跑两节点注册时必须 `MAGPIE_REGISTER_HOSTNAME/IP --code`
 三件套覆盖身份（实测漏覆盖会把 95357 的 base_url 错改到本机，已修复）。
+
+## 2026-11-07 第六轮：审计、fake-ip 事故与修复（HEAD 65a97912 → 05d2a74a）
+
+合并 65a97912（codex proxied pill 的 respect_system_proxy 回归测试）后对本轮
+代码审计。Go 侧：`gofmt -l` 揪出 75df6f48 落地的 `internal/library/skillgit_test.go`
+未过 gofmt（已修，`go test ./internal/library` ok）；`go vet` agent/edit/gateway
+干净；`TestCodexProxied*` 回归绿；`make build` 出 HEAD 二进制。
+
+**部署**：本机 `.30` 节点（`magpie web`，XDG_CONFIG_HOME/CACHE 指
+`local-node/config|cache`）二进制 49fd3e47 → **05d2a74a**：:3446 web、:3425
+gateway（lan:true → 0.0.0.0）均 200；`/v1/models` 与旧二进制 A/B 完全一致
+（5 个 zcode 模型）；LAN 路径 `192.168.31.30:3425` 可达（无 key 401）。
+
+**事故（clash verge fake-ip TUN 打穿注册脚本）**：首次 `all` 实测里
+`lan_ip` 的 UDP connect 出口地址返回 **198.18.0.1**（clash TUN 的 fake-ip 段），
+幂等路径把它当 LAN IP PATCH 了 provider **95436**：base_url →
+`http://198.18.0.1:3426/v1`、display_name 嵌入假 IP（PATCH 200）。当时的 E2E
+200 是 glm-5.3-flash 的 NVIDIA NIM 候选出的活，没走 magpie，未立即暴露。已
+手工 PATCH 还原 base_url/display_name（200），随后的修复版脚本实测收敛如常。
+`~/.config/magpie` 下 8 个运行态文件被误启进程（没带沙箱 XDG 的一次启动）重写
+——该目录本就是 11-06 首次部署时误建的默认配置（无 settings.json、无用户数据，
+本机也没装 magpie.app），无实际损害，记录在案。
+
+**修复（magpie_gateway_register.py + run-local.sh，commit 05d2a74a + 本轮）**：
+
+1. **base_url 守卫升级为 RFC1918 全量校验**：自动检测到的地址必须是
+   10/8、172.16/12、192.168/16 之一；回环、169.254/16、100.64/10（netbird，
+   网关 egress 守卫熔断）、**198.18/15（fake-ip TUN）**一律拒绝
+   （`REGISTER_RESULT=fail-non-lan-ip`，退出 1）。`MAGPIE_REGISTER_IP` 显式
+   声明仍放行（操作者自己的决定）。`lan_ip` 同步过滤假段，UDP 结果非 RFC1918
+   时回落 getaddrinfo 枚举。13 个判定用例 + 用真实事故值 198.18.0.1 的守卫
+   实证。
+2. **回环目标直连**：`http_json` 对 127.0.0.1/localhost/::1 用空 ProxyHandler
+   强制直连——clash verge 的 `http_proxy` 在手时 urllib 会把本机 magpie 的请求
+   也交给代理（代理回不到本机回环 → 502/超时，"本地端口无法访问"的典型成因）。
+   坏代理 env + 本地假服务器实证 200。
+3. **登录鉴权路径**：新增 `--gateway-admin-user/--gateway-admin-password`
+   （env `LLM_GATEWAY_ADMIN_USER/PASSWORD`），走网关自己的
+   `POST /api/auth/token` 换 token——管理端 UI/maestro 同路。此前只支持
+   自签 super_admin JWT，而 211/252 的签名密钥本机没有 SSOT（`.env.252.enc`
+   与 age key 都不在），脚本实际跑不起来。maestro_test 实为 super_admin，
+   实测登录 → 列 providers → PATCH 全通。
+4. **证据不再自相矛盾**：serve 凭据创建失败原先先记 `fail-cred-httpX` 又被
+   末尾 `REGISTER_RESULT=ok` 覆盖；现在结论记 `partial` 且退出非 0（能绑的
+   绑定照做）。BIND_MODELS 空时不再同时打 `=none` 和 `=` 两行。
+5. **密钥脱敏**：secret/test key/caller key/管理端密码统一进 SECRETS，
+   `log`/`evidence` 输出前替换为 `[REDACTED]`。
+6. **杂项**：`/api/providers` 非 200 时不再无声吞成空列表（本次审计就被
+   401-吞空误导过一轮）；`e2e/all` 缺 test key 快速报错（原来发 `Bearer None`）；
+   死代码出清（`.local` 替换在去点后永假、TRIAL_STD 未用、quota 双重
+   find_by_code、`443 if "https" else 8781` 恒真分支——探测端口改按网关
+   scheme 取）。
+7. **run-local.sh**：三处 CDP 探测 curl 加 `--noproxy '*'`——clash 的
+   `http_proxy` 会让 127.0.0.1:9222 的探测进代理，Chrome 被误判起不来。
+
+**实测（登录鉴权，MAGPIE_REGISTER_HOSTNAME/IP 钉 .30 身份，
+--magpie http://127.0.0.1:3425）**：
+`VERIFY_PLATFORM=Darwin/arm64`、`HOSTNAME=niuerdeMacBook-Pro.local`、
+`REGISTER_MODE=idempotent-patch`、`PROVIDER_ID=95436`、凭据 99030(serve)+
+99033(trial) 双 existing、`BINDINGS_AFTER` 5 模型、`REGISTER_RESULT=ok`；
+E2E（第三方 key）glm-5.3-flash → 200；**magpie 独占模型 glm-5.3 → 200
+`MAGPIE-ATTRIB-OK`**（排除 NIM 候选的归属验证）；本机直连
+:3425 `zcode/GLM-5.3` → 200 `LOCAL-DIRECT-OK`；quota snapshot PATCH 200；
+usage 200/200（provider_name 已是
+`magpie @ niuerdeMacBook-Pro.local (192.168.31.30)`，notes.ip 同步收敛）。
+网关上 95436 终态：base_url=`http://192.168.31.30:3425/v1`、
+registration=auto、magpie_port=3425。
+
+**Maestro**：5 flow 全绿（m1/m2/m3 + g1/g2），报告
+`tests/maestro/reports/20261107-005906/`。
+
+**本轮新建网关数据面 key**：id 230 `magpie-round6-e2e`（app e2e-magpie-test）
+——key 列表不回显既有值，沿用往轮建一次性 key 的做法（229 `magpie-e2e-test`
+同例）。
+
+**网关侧问题（不在 magpie 仓库修复）**：
+
+5. **trial 桶夜间 0 候选**：01:00（+0800，夜间桶 23:00–09:00 内）调
+   `glm-5.3-flash-trial` → 503 `no_candidates, tried=0`，而两个 trial 凭据
+   （99032/99033）`availability_state=ready`、`GET /api/routing/resolve` 也
+   列得出候选——请求路径的规划器与 resolve 不一致。疑似规划器按 UTC 评估
+   夜间桶（01:00 +0800 = 16:xx UTC，被判白天）。第五轮"夜间窗口自动出活"
+   的预期未兑现，留待 llm-gateway-go 仓查证。
+
+**未试**：Windows/Linux 部署重放（本轮无相关变更）；trial 桶真实出活
+（被上面第 5 条挡住，与 magpie 侧无关）。
