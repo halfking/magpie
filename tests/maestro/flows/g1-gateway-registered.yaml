@@ -1,7 +1,11 @@
 # g1 — llm.itestu.cn 管理端：供应商列表里出现自动注册的 magpie 节点
 # 列表 800+ 行按名称排序，magpie 行在很后面 ⇒ 用过滤栏的搜索框（占位文案
-# 「搜索显示名…」，无 id）过滤后再断言行。
+# 「搜索显示名…」/ "Search display name..."，无 id）过滤后再断言行。
 # Maestro 的 text 是全匹配 textRegex：值当正则编译 ⇒ 断言值别带括号等元字符。
+# 页面语言随浏览器 profile 而异（新 CDP profile 默认英文）⇒ 标题/占位文案用
+# 中英 alternation 正则；行断言 display_name 与语言无关。
+# 供应商列表端点要求 super_admin ⇒ .env.local 的账号要有该角色（2026-11-07 踩过：
+# tenant_admin 登录成功但列表 403，页面只剩空表）。
 url: ${GATEWAY_URL}
 ---
 - runFlow:
@@ -12,14 +16,15 @@ url: ${GATEWAY_URL}
       GATEWAY_ADMIN_PASSWORD: ${GATEWAY_ADMIN_PASSWORD}
 - openLink: ${GATEWAY_URL}/providers
 - extendedWaitUntil:
-    visible: '供应商管理'
+    visible: '供应商管理|Provider Management'
     timeout: 30000
-- tapOn: '搜索显示名.*'
-- inputText: 'magpie'
+- tapOn: '搜索显示名.*|Search display name.*'
+- inputText: 'magpie @ ${GATEWAY_MAGPIE_HOST}'
 - extendedWaitUntil:
     # 自动注册的 provider 行：display_name 由注册脚本生成，与语言无关。
-    # runner 用 --screen-size 1280x2000 的大视口：过滤后整行都在视口内，
-    # 不需要滚动（表格有自己的滚动容器，页面级滚动到不了它）。
+    # 搜索是 display_name 的前缀匹配（'yonyou' 在中段，过滤 0 行；'magpie' 前缀
+    # 匹配出的多行里我们的行按名排序垫底，且 v2.5.9 把 notes JSON 渲染进单元格
+    # 后行高巨大、滚不出来）⇒ 用 'magpie @ <host>' 前缀，只剩我们的行且在最前。
     visible: 'magpie @ ${GATEWAY_MAGPIE_HOST}.*'
     timeout: 20000
 - takeScreenshot: g1-providers

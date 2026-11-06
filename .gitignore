@@ -10,3 +10,4 @@
 .codegraph/
 .deployment-validation/
 /internal/update/launcher-*.com
+__pycache__/

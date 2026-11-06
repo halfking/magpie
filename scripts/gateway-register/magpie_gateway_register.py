@@ -233,26 +233,59 @@ def magpie_models(magpie_base, caller_key, timeout=20):
 
 def read_quotas(config_dir):
     """读 magpie 配置目录 quotas.json → 每账号余量摘要（多平台路径由调用方传入）。"""
-    path = os.path.join(config_dir, "quotas.json")
-    if not os.path.isfile(path):
+    path = os.path.join(config_dir, "quotas.json") if config_dir else None
+    if path and os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict):
+            return _quota_summary(raw)
+    return None
+
+
+def read_quotas_api(magpie_base, caller_key, timeout=30):
+    """兜底：读网关 /v1/magpie/quotas（quotas.json 未落盘时的等价来源，2026-11-07 审计修复）。
+
+    keepLast 对含 pool 窗口的账号跳过写盘（.19 实测 quotas.json 始终不存在），
+    网关 API 是同一份数据的线上来源。返回与 read_quotas 相同的形状。
+    """
+    st, body = http_json("GET", magpie_base.rstrip("/") + "/v1/magpie/quotas",
+                         headers={"Authorization": "Bearer " + caller_key}, timeout=timeout)
+    if st != 200:
+        log("/v1/magpie/quotas: HTTP %s" % st)
         return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
+    rows = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
         return None
+    raw = {}
+    for r in rows:
+        acc = r.get("provider") or r.get("id") or r.get("name")
+        if not acc:
+            continue
+        raw[acc] = {"quota": {"windows": r.get("windows") or []}, "at": r.get("asOf")}
+    return _quota_summary(raw) if raw else None
+
+
+def _quota_summary(raw):
     out = {}
-    now = time.time()
     for account, entry in raw.items():
         windows = (entry.get("quota") or {}).get("windows") or []
         wsum = []
         for w in windows:
             item = {"name": w.get("name"), "used": w.get("used")}
-            if w.get("limit"):
+            if w.get("remaining") is not None:
+                # /v1/magpie/quotas 自带 remaining，直取比 amount/used 换算准
+                item["limit"] = w.get("limit")
+                item["left"] = round(w["remaining"], 1)
+            elif w.get("limit"):
                 item["limit"] = w.get("limit")
                 item["left"] = round(w["limit"] - (w.get("amount") if w.get("amount") is not None else (w.get("used") or 0) * (w["limit"] / 100.0)), 1)
             if w.get("resetsAt"):
                 item["resetsAt"] = w.get("resetsAt")
+            if w.get("display"):
+                item["display"] = w.get("display")
             wsum.append(item)
         out[account] = {"windows": wsum, "readAt": entry.get("at")}
     return out
@@ -338,12 +371,20 @@ def cmd_register(args):
     trial_models = [m for m in want if m == TRIAL_RAW]
     std_models = [m for m in want if m != TRIAL_RAW]
 
+    rotate_needed = []  # (cid, label)：key 漂移的凭据在绑定就绪后轮转
+
     def ensure_cred(label, conc):
         cred = next((c for c in creds if (c.get("label") or "") == label), None)
         if cred:
             cid = cred["id"]
             log("credential exists: id=%s label=%s" % (cid, label))
             evidence("CREDENTIAL_MODE_" + label.upper().replace("-", "_"), "existing")
+            #2026-11-07 审计修复：重建实例后 caller key 会换，密文里的旧 key 只会
+            #表现成 auth_failed（第三轮 99027 的坑）。幂等复跑时把这类凭据轮转到
+            #当前 key；rotate 要在绑定之后做（rotate-primary-key 需要一个已绑模型名
+            #做探针），先记下来。
+            if (cred.get("availability_state") or "") == "auth_failed":
+                rotate_needed.append((cid, label))
         else:
             st, body = gw.api("POST", "/api/providers/%s/credentials" % pid,
                     {"label": label, "api_key": args.magpie_caller_key,
@@ -386,9 +427,26 @@ def cmd_register(args):
                     "outbound_model_name": m, "available": True,
                     "context_window": args.context_window})
             log("bind %s to %s : HTTP %s %s" % (std, m, st, json.dumps(body, ensure_ascii=False)[:120]))
+            if st not in (200, 201):
+                log("  !! 绑定 API 失败（HTTP %s）。若为 500/42P08（$8 参数类型），"
+                    "走 SQL fallback: scripts/gateway-register/bind-via-ssh.sh %s '%s,%s'"
+                    % (st, target_cid, m, std))
 
     bind_models(cid, std_models)
     bind_models(trial_cid, trial_models)
+
+    #4) key 漂移自愈：auth_failed 的既有凭据轮转到当前 caller key（探针需要
+    #一个已绑模型名，所以放在绑定之后）。rotate 会触发一次绑定 refresh，
+    #BINDINGS_AFTER 在其后读数才算数。
+    all_bound = std_models + trial_models
+    for rcid, rlabel in rotate_needed:
+        probe_model = all_bound[0] if all_bound else "zcode/GLM-5.3"
+        st, body = gw.api("POST", "/api/providers/%s/credentials/%s/rotate-primary-key" % (pid, rcid),
+                {"api_key": args.magpie_caller_key, "raw_model_name": probe_model})
+        log("credential %s (%s) auth_failed → rotate primary key: HTTP %s %s"
+            % (rcid, rlabel, st, json.dumps(body, ensure_ascii=False)[:120]))
+        evidence("KEY_ROTATE_" + rlabel.upper().replace("-", "_"), str(st))
+
     all_live = set()
     for target in (cid, trial_cid):
         if target is not None:
@@ -427,18 +485,23 @@ def cmd_e2e(args):
         evidence("E2E_SECONDS", "%.1f" % dt)
         return 0
     log("E2E FAIL HTTP %s: %s" % (st, json.dumps(resp, ensure_ascii=False)[:400]))
-    evidence("E2E_STATUS", str(st) or "err")
+    evidence("E2E_STATUS", "err" if st == 0 else str(st))
     return 1
 
 
 def cmd_quota(args):
-    """余量同步: magpie quotas.json → PATCH provider notes.quota_snapshot。"""
+    """余量同步: magpie quotas.json（缺失时 /v1/magpie/quotas 兜底）→ PATCH provider notes.quota_snapshot。"""
     ident = detect_identity(args.gateway)
     q = read_quotas(args.magpie_config_dir)
+    source = "quotas.json"
     if q is None:
-        log("quotas.json 不存在于 %s（用 --magpie-config-dir 指定 magpie 配置目录）" % args.magpie_config_dir)
+        q = read_quotas_api(args.magpie, args.magpie_caller_key)
+        source = "/v1/magpie/quotas"
+    if not q:
+        log("余量不可得：quotas.json 不存在于 %s 且 /v1/magpie/quotas 不可用" % args.magpie_config_dir)
         evidence("QUOTA_SYNC", "missing-config")
         return 1
+    log("quota source: %s" % source)
     snap = {"quota_synced_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "accounts": {k: v for k, v in list(q.items()) if "zcode" in k.lower()} or q}
     log("quota accounts: %d (zcode: %d)" % (len(q), len(snap["accounts"])))
@@ -507,8 +570,7 @@ def cmd_all(args):
     log("\n── 等待探针收敛 (probe) ──")
     time.sleep(args.probe_wait)
     rc = cmd_e2e(args)
-    if args.magpie_config_dir:
-        cmd_quota(args)
+    cmd_quota(args)  # quotas.json 缺失时走 /v1/magpie/quotas 兜底，不再依赖 config dir
     cmd_usage(args)
     return rc
 

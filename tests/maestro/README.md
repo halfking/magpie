@@ -58,6 +58,8 @@ profile，退出时收掉），逐 flow `maestro test --driver-host-port 9222 -e
 
 - Maestro CLI 2.11.0 **没有** `--env-file`，flow 的 `${VAR}` 也**不读** shell 环境
   变量——只能 `-e K=V` 逐个传（口令经进程 argv，本机 ps 可见，不落盘不进 git）。
+- `.env.local` 被 run-local.sh **bash source** 读入：写 shell 语法 `KEY="value"`，
+  别照 env.yaml 的 `KEY: "value"` YAML 形状抄（source 会报 command not found）。
 - magpie web 的导航是 `data-view` 属性的单页切换，没有 URL 路由：flow 里用
   `tapOn: '供应商'` 导航，靠 DOM 顺序命中侧边导航（侧边栏在 main 之前）。
 - llm.itestu.cn 登录框的**用户名默认预填 admin**，`inputText` 是**追加**——
@@ -66,3 +68,10 @@ profile，退出时收掉），逐 flow `maestro test --driver-host-port 9222 -e
 - 详情页默认页签没有 notes/registration 字段，注册方式的证明走 API
   （GET /api/providers 的 notes.registration=auto），UI 层断言 display_name
   与 base_url 即可。
+- **Windows 上不要传 `--driver-host-port`**（run-local.sh 已默认不传，要旧行为
+  `MAESTRO_PASS_DRIVER_PORT=1`）：maestro 对该端口做的是 ServerSocket 试绑探测，
+  CDP Chrome 占着 127.0.0.1:9222 时，Windows 的 wildcard 绑定必然 EADDRINUSE
+  （macOS 靠 SO_REUSEADDR 语义放行，Java 在 Windows 不开）。WEB 驱动的
+  CdpClient 默认就连 localhost:9222，不传参数行为不变。
+- 供应商卡的套餐名随账号而异（GLM Coding Max/Lite/Pro…），flow 只断言
+  `GLM Coding.*` 前缀，别写死套餐。

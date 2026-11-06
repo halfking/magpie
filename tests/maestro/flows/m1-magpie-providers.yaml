@@ -15,6 +15,7 @@ url: ${MAGPIE_URL}
     visible: '已登录 ZCode.*'
     timeout: 20000
 - extendedWaitUntil:
-    visible: 'GLM Coding Max'
+    # 套餐名随账号而异（Max/Lite/Pro…），断言前缀：卡片右侧的「GLM Coding <套餐>」
+    visible: 'GLM Coding.*'
     timeout: 10000
 - takeScreenshot: m1-providers

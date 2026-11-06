@@ -310,3 +310,89 @@ skillgit_test.go，第六轮的 gofmt 修复保持。）
 
 **未试**：Windows/Linux 部署重放（本轮无相关变更）；trial 桶真实出活
 （被上面第 5 条挡住，与 magpie 侧无关）。
+##2026-11-07 第六轮-B：.19（Windows/yonyou）首次落地 + 审计修复 + Maestro 全绿
+
+（上节第六轮的「未试：Windows/Linux 部署重放」由本节兑现。）
+
+第二轮被 SSH 凭据阻塞的 .19（192.168.31.19，Windows 10，hostname=yonyou）改为
+**本机直接部署**（无需 SSH），从 65a97912+审计修复构建，注册/网关 E2E/UI 黑盒
+全部打通。
+
+**部署拓扑**：`C:\workspace\magpie\.deployment-validation\magpie-node\`（便携
+模式，`.portable` + `data\`），`MAGPIE_WEB_KEY` + `MAGPIE_ADDR=0.0.0.0:3426`
++ `magpie web --addr 0.0.0.0:3446 --no-open`，settings.json `{"lan":true,
+"lang":"zh"}`。ZCode 登录态（bigmodel Start Plan，GLM Coding Lite）启动 20s
+后由 `KeepRetiringMoved` 自动迁到插件 `@magpie-community/opencode-zcode-auth`
+（0.1.51→0.1.52 自动升级），/v1/models 25 个、独有 5 个 `zcode/*`。共享网关
+key `211-gateway`。本地直连出活：`zcode/GLM-5.3` → 200 `LOCAL-UNIQUE-OK`。
+
+**Windows 防火墙坑（新，记档）**：节点首启弹的防火墙提示无人应答，Windows
+为该 exe 自动生成两条**程序级 Block** 规则（Public 档，TCP+UDP）——Block 压过
+Allow，211 → .19:3426 超时（22 端口有 sshd 放行规则可通，对照定位）。进程
+存活时删 Block 规则会立刻重生；正确顺序：**停进程 → 删 Block → 建 Allow
+（程序级）→ 再启动**。修复后 211 → .19:3426/v1/models 200。
+
+**审计修复（本轮 9 处）**：
+1. `magpie_gateway_register.py` 死条件 `443 if "https" else 8781`（恒真）；
+2. **key 漂移自愈**：既有凭据 `availability_state=auth_failed` 时幂等复跑
+   自动 `rotate-primary-key` 到当前 caller key（第三轮 99027 的坑，需在绑定
+   之后轮转——rotate 探针要求已绑模型名）；
+3. `cmd_quota` 双重 `find_by_code`（两次 API）；
+4. 绑定 API 500 时给出 42P08 SQL fallback 指引；
+5. e2e 网络错误 evidence 区分 `err`/HTTP code；
+6. **quota 来源兜底**：quotas.json 未落盘时（keepLast 对含 pool 窗口的账号
+   跳过写盘，本机实测如此）自动改读 `/v1/magpie/quotas`，`remaining` 直取；
+7. `cmd_all` 不再依赖 `--magpie-config-dir` 才同步 quota；
+8. `run-local.sh` Windows 适配（JDK/Chrome 查找 + maestro PATH 兜底）；
+9. `internal/library/skillgit_test.go` gofmt 漂移（code-standards 验收项）。
+
+**注册**：provider **95464**（code=magpie-yonyou）+ 凭据 **99034 magpie-serve**
+（并发3）/ **99035 magpie-trial**（并发3），availability_state 均 ready（探针
+200）。discovery 给新凭据秒灌全量目录且 outbound_model_name 为空（第五轮坑
+重现）——SQL 收窄：99034 只留 4 个 STD GLM、99035 只留 trial，outbound 补齐
+`zcode/*`，`manual-*` + `admin_protected` 防复发。**emergency-repair
+force_enable 是按凭据作用域**（本轮从网关源码确认，`credential_id` 必填），
+但它会把该凭据全部绑定置 available（cmb_rows_updated=25）——force_enable
+之后再收窄一次即可，勿对收窄过的老凭据使用。
+
+**网关 E2E（第三方视角）**：新签发数据面 key（id 231，`POST /api/keys` 直接
+返回明文）经 `llm.itestu.cn/v1/chat/completions` model=`glm-5.3-flash-trial`
+→ **200 "NODE19-GATEWAY-E2E-OK"**（12.6s）。归属铁证=网关容器 audit 日志：
+`upstream_url=http://192.168.31.19:3426/v1/chat/completions provider=95464
+credential=99035 upstream_status=200 success=true`（resolve top 是 .36 的
+99032，活体检查跳过后 attempt=0 实发 .19）。复跑 1×200（4.7s）；中间两次
+503/失败为候选失败冷却（transient）。quota snapshot PATCH 进 95464 notes
+（200，来源=/v1/magpie/quotas：5h 74/2000、Weekly 10000/10000 至 11-11、
+trial 周末桶 21.5M/500M）。
+
+**网关侧残留问题（不在本仓库修）**：
+- usage_ledger_hot 的归属字段记的是 **resolve top 候选**而非实际服务凭据
+  （audit 日志 95464/99035，热表行 95433/99032，时延逐毫秒一致）→
+  `/api/usage/providers/95464` 仍按零流量 500（已知 no-rows bug 叠加此归属
+  偏差）；usage by models 200（空）。
+- 绑定 API 42P08（$8 无 cast）依旧，SQL fallback 可用。
+
+**Maestro 黑盒（tests/maestro，本机 Windows 首跑）**：5 flow 全绿
+（m1 供应商 / m2 用量 / m3 网关 / g1 管理端列表 / g2 详情页）。Windows 适配
+与修复：
+- `--driver-host-port` 在 Windows 不可用：maestro 对该端口做 **ServerSocket
+  试绑探测**，Chrome 占 127.0.0.1:9222 时 wildcard 绑定 EADDRINUSE（macOS 靠
+  SO_REUSEADDR 放行，Java 在 Windows 不开）。run-local.sh 默认不传该参数
+  （WEB 的 CdpClient 本就默认 localhost:9222），旧行为用
+  `MAESTRO_PASS_DRIVER_PORT=1` 显式开。
+- 管理端测试账号需 **super_admin**（供应商列表端点 403 tenant_admin）；
+  本轮建 `magpie-node19`（id 46）。
+- g1 两处随环境漂移的断言修正：页面语言随 profile（新 CDP profile 英文）
+  ⇒ 标题/占位改中英 alternation；管理端搜索是 display_name **前缀匹配**
+  且 v2.5.9 把 notes JSON 渲染进单元格（行高巨大，'magpie' 过滤出的多行里
+  我们的行垫底滚不出）⇒ 过滤词改 `magpie @ <host>`，只剩我们的行且在最前。
+- m1 套餐名随账号（Max/Lite）⇒ 断言 `GLM Coding.*` 前缀。
+- `.env.local` 必须 shell 语法（bash source），env.yaml 的 YAML 形状只是清单。
+
+**复跑方式**（本机）：`.deployment-validation\magpie-node\` 下
+`MAGPIE_WEB_KEY=$(cat webkey.txt) MAGPIE_ADDR=0.0.0.0:3426 ./magpie.exe web
+--addr 0.0.0.0:3446 --no-open`；`tests/maestro/.env.local` 就位后
+`bash tests/maestro/run-local.sh`；注册/E2E：
+`python scripts/gateway-register/magpie_gateway_register.py all --magpie
+http://127.0.0.1:3426`（LLM_GATEWAY_SECRET / LLM_GATEWAY_TEST_KEY /
+MAGPIE_CALLER_KEY 见 .deployment-validation 下 gitignored 文件）。

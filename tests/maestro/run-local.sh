@@ -45,22 +45,32 @@ fi
 find_jdk() {
   local c
   for c in "${MAESTRO_JAVA_HOME:-}" "${JAVA_HOME:-}"; do
-    [ -n "${c}" ] && [ -x "${c}/bin/java" ] && { printf '%s' "${c}"; return; }
+    [ -n "${c}" ] && { [ -x "${c}/bin/java" ] || [ -x "${c}/bin/java.exe" ]; } && { printf '%s' "${c}"; return; }
   done
   if command -v /usr/libexec/java_home >/dev/null 2>&1; then
     c="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
     [ -x "${c}/bin/java" ] && { printf '%s' "${c}"; return; }
   fi
   for c in /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home \
-           /Library/Java/JavaVirtualMachines/*/Contents/Home; do
-    [ -x "${c}/bin/java" ] && { printf '%s' "${c}"; return; }
+           /Library/Java/JavaVirtualMachines/*/Contents/Home \
+           "/c/Program Files/Eclipse Adoptium/"jdk-* \
+           "/c/Program Files/Java/"jdk-*; do
+    [ -n "${c}" ] && { [ -x "${c}/bin/java" ] || [ -x "${c}/bin/java.exe" ]; } && { printf '%s' "${c}"; return; }
   done
+  # PATH 上的 java：bin 的上级就是 JAVA_HOME
+  local j
+  j="$(command -v java 2>/dev/null || true)"
+  if [ -n "${j}" ]; then
+    c="$(cd "$(dirname "$(readlink -f "${j}" 2>/dev/null || printf '%s' "${j}")")/.." && pwd)"
+    { [ -x "${c}/bin/java" ] || [ -x "${c}/bin/java.exe" ]; } && { printf '%s' "${c}"; return; }
+  fi
   printf ''
 }
 JAVA_HOME_CANDIDATE="$(find_jdk)"
 [ -n "${JAVA_HOME_CANDIDATE}" ] || { echo "!! 找不到 JDK 17（设 MAESTRO_JAVA_HOME）" >&2; exit 2; }
 export JAVA_HOME="${JAVA_HOME_CANDIDATE}"
 export PATH="${JAVA_HOME}/bin:${PATH}"
+command -v maestro >/dev/null 2>&1 || PATH="$HOME/.maestro/bin:$PATH"   # Windows 默认安装位
 command -v maestro >/dev/null 2>&1 || { echo "!! PATH 里没有 maestro" >&2; exit 2; }
 
 # ── 3. 变量（口令只从 tests/maestro/.env.local 读，不进 git）────────────────
@@ -83,7 +93,10 @@ find_chrome() {
   for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
            "/Applications/Chromium.app/Contents/MacOS/Chromium" \
            "$(command -v google-chrome 2>/dev/null || true)" \
-           "$(command -v chromium 2>/dev/null || true)"; do
+           "$(command -v chromium 2>/dev/null || true)" \
+           "${LOCALAPPDATA:-}/Google/Chrome/Application/chrome.exe" \
+           "/c/Program Files/Google/Chrome/Application/chrome.exe" \
+           "/c/Program Files (x86)/Google/Chrome/Application/chrome.exe"; do
     [ -n "${c}" ] && [ -x "${c}" ] && { printf '%s' "${c}"; return; }
   done
   printf ''
@@ -130,11 +143,19 @@ E_ARGS=(
 )
 echo "== 跑 ${#FLOWS[@]} 个 flow → ${REPORT_ROOT}"
 FAILS=0
+# --driver-host-port 会触发 maestro 的端口 bind 探测（ServerSocket 试绑）：Chrome
+# 占着 127.0.0.1:<port> 时，Windows 上 wildcard 绑定必然 EADDRINUSE（macOS 靠
+# SO_REUSEADDR 语义放行）。WEB 驱动的 CdpClient 默认就连 localhost:9222，所以
+# Windows（或任何 bind 语义严格的平台）保持不传；要旧行为显式 MAESTRO_PASS_DRIVER_PORT=1。
+PORT_ARGS=()
+if [ "${MAESTRO_PASS_DRIVER_PORT:-0}" = "1" ]; then
+  PORT_ARGS=(--driver-host-port "${DRIVER_PORT}")
+fi
 for flow in "${FLOWS[@]}"; do
   name="$(basename "${flow}" .yaml)"
   echo "---- ${name}"
   if maestro test \
-      --driver-host-port "${DRIVER_PORT}" \
+      ${PORT_ARGS+"${PORT_ARGS[@]}"} \
       --headless \
       --no-ansi \
       --screen-size "${MAESTRO_SCREEN_SIZE:-1280x2000}" \
