@@ -480,9 +480,9 @@ usage 200/200。
   `Origin: null` 的 GET → 403（#2242 的守卫仍在）。GET 跨源 200 是有意的
   （守卫只拦写）。
 
-**未试**：trial 桶（Start Plan 周末桶）真实出活（本轮 E2E 用 glm-5.3/
-glm-5.3-flash，trial 余额在 m2 卡片可见：114M/500M）；Windows/Linux 重放
-（本轮无相关变更）。round8-node 保持运行（web :3446 / 网关 :3427），复跑：
+**未试**：trial 桶（Start Plan 周末桶）真实出活——由本节补的实测兑现
+（trial E2E 200，见下）；Windows/Linux 重放（本轮无相关变更）。
+round8-node 保持运行（web :3446 / 网关 :3427），复跑：
 
 ```bash
 # 节点（XDG 沙箱）
@@ -496,3 +496,44 @@ MAGPIE_REGISTER_HOSTNAME=niuerdeMacBook-Pro.local MAGPIE_REGISTER_IP=192.168.31.
 # Maestro
 bash tests/maestro/run-local.sh
 ```
+
+## 2026-11-07 第八轮补：Start Plan GLM 家族对所有人可见、可用（运营面修复）
+
+目标（本轮要求）：ZCode Start Plan 的 glm-5.3-flash 系模型要**提供给所有人**。
+实测结论与修复：
+
+**可用性（修复前已具备，实测坐实）**：第三方 key 经 llm.itestu.cn——
+glm-5.3-flash-trial **200**（57.4s，夜间/周末桶的真实速度；第六轮记录的
+「夜间 0 候选 503」未复现，周六凌晨周末桶放量正常）且归属 magpie 节点
+（账本 03:34:50 `GLM-5.3-Flash-Trial` callerKey=211-gateway 200/57.2s）；
+glm-5.3-flash 200（1.5s，走 NIM——resolve 排序 NIM prio1/2/3 在前、magpie
+99027/99030 prio3 在后为热备，NIM rank1 此刻 cooling；网关每 15~25s 在探测
+magpie 的 flash 候选，热备是活的）；glm-5.2 / glm-5-turbo 200（1.0~1.4s）。
+
+**可见性（修复前缺失，本轮修复）**：第三方 `GET /v1/models` 默认精选口径
+只剩 8 个模型，Start Plan 家族不可见（调得通但用户不知道）；`?scope=all`
+806 个里 trial 也缺。根因两层：
+1. **精选清单**（`routing_policy.featured_models`，2026-10-29 起 /v1/models
+   默认口径）没有 trial/5.2/5-turbo；
+2. **门谓词**（domains/streaming/models.go modelsRoutableSQL）排除
+   `admin_protected=TRUE` 的绑定——而 `bind-via-ssh.sh` 直插绑定**硬编码
+   admin_protected=TRUE**（防 discovery 放大的收窄手段），magpie 凭据的
+   5 个保留 GLM 绑定全带此标记；路由不受影响（resolve 不看这列），
+   发现列表却把它们藏掉了。glm-5.3/flash 之前能露出全靠 NIM/社区供应商
+   的无保护绑定，其探针翻车即从列表消失（实测中途从 9 个缩到 8 个）。
+
+**修复（运营面，网关 211）**：
+1. `PATCH /api/routing/featured`：featured_models 31 → 34，并入
+   `glm-5.3-flash-trial / glm-5.2 / glm-5-turbo`（200）；
+2. SQL 解开 **99030**（round8 节点 serve 凭据，目录仅 13 模型、discovery
+   放大有界）5 个保留 GLM 绑定的 admin_protected（UPDATE 5，走
+   bind-via-ssh 同通道；99027/99032 属 265 目录旧 serve 实例，动它必触发
+   全量放大，未动）。
+3. 效果：第三方默认 `/v1/models` 8 → **11 个**，完整列出
+   `glm-5-turbo / glm-5.2 / glm-5.3 / glm-5.3-flash / glm-5.3-flash-trial`；
+   scope=all 里 trial 也在。修复后 trial E2E 复跑 200（13.9s）。
+
+**残留与告诫**：bind-via-ssh.sh 的硬编码 admin_protected 未改（收窄场景
+仍需要它）——今后凡用 SQL 收窄 magpie 绑定，记得对**保留行**回解
+admin_protected，否则该模型会再从发现列表消失；99030 解保护后整点
+discovery 可能补灌本机目录其余 8 个模型（本就由该节点真实服务，属预期）。
