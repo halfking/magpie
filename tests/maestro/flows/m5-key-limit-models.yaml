@@ -1,0 +1,33 @@
+# m5 — 网关密钥额度按模型计数（1f439ecc5，2026-11-06 进 48h 窗口）：额度编辑器
+# 多了「模型」字段（此额度计入的模型），默认「全部模型」，点开是 caller-keys/models
+# 菜单，可按 <provider>/<model> 或 <provider>/* 收窄。本 flow 只开不合：
+# 不填 tokens/cost、不点保存，编辑器与菜单的落点用截图作证。
+url: ${MAGPIE_URL}
+---
+- launchApp
+- extendedWaitUntil:
+    visible: '供应商'
+    timeout: 30000
+- tapOn: '网关'
+- extendedWaitUntil:
+    visible: '211-gateway'
+    timeout: 20000
+# 未设额度的限额徽标平时折叠（.amodels:not(.set) opacity:0），行被指向才显出：
+# 先点一下行名让虚拟指针悬停其上，再点行内的「限额」
+- tapOn: '211-gateway'
+- tapOn: '限额'
+- extendedWaitUntil:
+    # 额度编辑器里的「模型」字段选择钮，默认文案
+    visible: '全部模型'
+    timeout: 10000
+# 「全部模型」有两个：行首是密钥本体的模型选择 pill（旧功能 #905，菜单头
+# 「此密钥可用的模型」），编辑器里的选择钮在 DOM 靠后——index 1 才是额度的
+# 「此额度计入的模型」菜单（1f439ecc5）
+- tapOn:
+    text: '全部模型'
+    index: 1
+- extendedWaitUntil:
+    # 模型菜单头 + 菜单里的 <provider>/<model> 注记
+    visible: '此额度计入的模型'
+    timeout: 10000
+- takeScreenshot: m5-key-limit-models

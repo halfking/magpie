@@ -426,3 +426,73 @@ settings.json 补 `"port": 3426`（与 `lan:true` 一起让网关免 MAGPIE_ADDR
 `INSTALLED-AUTOSTART-OK`（audit：provider=95464 credential=99035）✓；
 `magpie-cli autostart` → "opens at login, in the tray" ✓。
 下次登录起自动拉起；重启后无需人工介入。
+
+## 2026-11-07 第八轮：.30/.36 Mac 节点按最新 HEAD 重部署 + 48h 新功能的 Maestro 覆盖
+
+HEAD fcd829a52（构建 `v0.1.3190-0.20261106184357-fcd829a5212e`，`make build`）。
+本机（IP 又从 .30 漂回 **.36**）全新便携节点 `.deployment-validation/round8-node/`
+（XDG 沙箱 config/cache，`settings.json {"lan":true,"lang":"zh","port":3427}`）：
+web `:3446`（MAGPIE_WEB_KEY，cookie 流 303→200）、网关 `:3427` 绑 `*:3427`（tcp46）。
+启动即见 `moved zcode to its plugin`；/v1/models 13 个、独有 5 个 `zcode/*`；
+LAN 边界：无 key 401 / 有 key 200；直连 `zcode/GLM-5.3` 出活（200）。
+
+**坑（新）**：settings 的 `lang` 合法值是 `system|en|zh|zh-TW|ja|de`
+（internal/settings Langs）——写 `"zh-CN"` 被校验拒掉，UI 落回英文，Maestro
+中文断言全线空match。改 `"zh"` 重启即正。tests/maestro/README 的写法已同步纠正。
+
+**注册**：provider **95436** 幂等 PATCH：base_url `http://192.168.31.30:3425/v1`
+→ `http://192.168.31.36:3427/v1`（IP+端口双漂移，PATCH 200），display_name 收敛
+`magpie @ niuerdeMacBook-Pro.local (192.168.31.36)`，registration=auto；凭据
+99030(serve)/99033(trial) existing，绑定 5/5。**新坑（轮）**：节点换端口重建后
+凭据密文里的旧 caller key（尾号 b4e2）在网关侧还没被探针标成 auth_failed
+（状态是漂移前的陈 ready），注册脚本的漂移自愈没触发——网关请求以 401 打到
+新 base_url（节点日志三连拒）后回落旧候选，前两次 E2E 200 的归属因此存疑。
+手动 `rotate-primary-key`（202，probe queued）后**数据面仍持旧 key**（URSM
+内存快照）——再按凭据 `emergency-repair force_enable`（200，cmb 5 行 +
+node_probe + URSM 刷新）后归属坐实：glm-5.3（magpie 独占）E2E 200
+`ROUND8-ATTRIB3-OK`，**节点账本 03:08:29 两条 200（GLM-5.3 E2E + trial probe）
+callerKey 均为 `211-gateway`**。quota snapshot PATCH 200（来源 /v1/magpie/quotas）；
+usage 200/200。
+
+**脚本修复（本轮 2 处，magpie_gateway_register.py）**：
+1. base_url 漂移轮里 existing 凭据**一律进 rotate 队列**（原先只看
+   auth_failed，等不到——见上）；
+2. rotate 成功后按凭据 `emergency-repair force_enable` 一次，把 cmb/URSM/
+   node_probe 一并刷新（rotate 只改库，数据面不刷新就仍打旧 key）。
+   SQL 手工收窄过的老凭据仍不要走这条路（force_enable 会把全部绑定置
+   available，round-6-B 的告诫不变）。幂等复跑（无漂移）实测不触发新分支，
+   REGISTER_RESULT=ok、E2E 200/2.0s。
+
+**Maestro（7 flow 全绿，reports/20261107-032648，EXIT=0）**：原 5 flow
+（m1 供应商 / m2 用量 / m3 网关 / g1 管理端列表 / g2 详情页）+ **新增 2 flow
+覆盖 48h 窗口内上游合并的新功能**：
+- **m4-routing-groups**（80ae904c2，路由组独立页）：侧栏导航项「路由组」、
+  工具栏「新建组」（零分组页也渲染）、组编辑器开合（取消，不落保存）；
+- **m5-key-limit-models**（1f439ecc5，额度按模型计数）：211-gateway 行
+  「限额」→ 额度编辑器「模型」字段（默认「全部模型」）→ 菜单头
+  「此额度计入的模型」+ `codex/*`/`<provider>/<model>` 条目。
+  m5 的坑：行首还有**密钥本体**的模型选择 pill（旧功能 #905，文案同为
+  「全部模型」、菜单头「此密钥可用的模型」）——Maestro `index: 1`（DOM 靠后）
+  才命中额度编辑器的那颗。
+- 附带 API 证据（361da10ee，页面 API 只答自己 origin）：POST
+  `/api/usage/arrange` 同源 200；`Origin: http://127.0.0.1:9999` 与
+  `https://evil.example` → 403，日志 `turned away … from another page`；
+  `Origin: null` 的 GET → 403（#2242 的守卫仍在）。GET 跨源 200 是有意的
+  （守卫只拦写）。
+
+**未试**：trial 桶（Start Plan 周末桶）真实出活（本轮 E2E 用 glm-5.3/
+glm-5.3-flash，trial 余额在 m2 卡片可见：114M/500M）；Windows/Linux 重放
+（本轮无相关变更）。round8-node 保持运行（web :3446 / 网关 :3427），复跑：
+
+```bash
+# 节点（XDG 沙箱）
+XDG_CONFIG_HOME=$PWD/.deployment-validation/round8-node/config \
+XDG_CACHE_HOME=$PWD/.deployment-validation/round8-node/cache \
+MAGPIE_WEB_KEY=$(cat .deployment-validation/round8-node/webkey.txt) \
+  ./magpie web --addr 0.0.0.0:3446 --no-open
+# 注册/E2E（密钥见 .deployment-validation/round8-node/{gateway-key-211-gateway,testkey}.txt）
+MAGPIE_REGISTER_HOSTNAME=niuerdeMacBook-Pro.local MAGPIE_REGISTER_IP=192.168.31.36 \
+  python3 scripts/gateway-register/magpie_gateway_register.py all --magpie http://127.0.0.1:3427
+# Maestro
+bash tests/maestro/run-local.sh
+```

@@ -6,7 +6,7 @@
 # 逐 flow 跑并汇总。Maestro CLI 2.11.0 没有 --env-file，${VAR} 也不读 shell 环境。
 #
 # 用法：
-#   bash tests/maestro/run-local.sh                # 全量（m1..m3 + g1..g2）
+#   bash tests/maestro/run-local.sh                # 全量（m1..m5 + g1..g2）
 #   bash tests/maestro/run-local.sh m1-magpie-providers   # 只跑名字匹配的 flow
 #
 # 前置：
@@ -36,6 +36,8 @@ if [ "${#FLOWS[@]}" -eq 0 ]; then
     flows/m1-magpie-providers.yaml
     flows/m2-magpie-usage.yaml
     flows/m3-magpie-gateway.yaml
+    flows/m4-routing-groups.yaml
+    flows/m5-key-limit-models.yaml
     flows/g1-gateway-registered.yaml
     flows/g2-gateway-provider-detail.yaml
   )

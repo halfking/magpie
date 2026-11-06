@@ -8,6 +8,8 @@
 | m1-magpie-providers | magpie web | 本机 agent 登录态被发现：供应商页出现已登录 ZCode、GLM Coding Max |
 | m2-magpie-usage | magpie web | start plan 窗口卡片（5 小时/每周）与剩余额度走势 —— quota 同步的数据源 |
 | m3-magpie-gateway | magpie web | 网关运行、共享密钥、独有模型 zcode/GLM-5.3 —— 注册的出口侧 |
+| m4-routing-groups | magpie web | 48h 新功能（80ae904c2）：「路由组」独立页——导航项、工具栏「新建组」、组编辑器开合 |
+| m5-key-limit-models | magpie web | 48h 新功能（1f439ecc5）：网关密钥额度的「此额度计入的模型」选择器与其模型菜单 |
 | g1-gateway-registered | llm.itestu.cn 管理端 | 供应商列表出现自动注册的 `magpie @ <host>` 行 |
 | g2-gateway-provider-detail | llm.itestu.cn 管理端 | 详情页：base_url 指向本机 magpie、`magpie-serve` 凭据、模型就位 |
 
@@ -22,7 +24,8 @@
    ```bash
    MAGPIE_WEB_KEY=<16+字符key> magpie web --addr 0.0.0.0:3446 --no-open
    # settings.json 里 lan:true 才会把网关绑到 0.0.0.0（--lan 只作用 web 页）
-   # settings.json 里 lang:"zh-CN" 钉住 UI 语言，headless Chrome 英文环境下断言才稳
+   # settings.json 里 lang:"zh" 钉住 UI 语言，headless Chrome 英文环境下断言才稳
+   # （合法值 system|en|zh|zh-TW|ja|de——写 "zh-CN" 会被校验拒掉，UI 落回英文）
    ```
 
    节点要有已登录的 ZCode（accounts discovery 默认开，magpie 自动读 ~/.zcode），

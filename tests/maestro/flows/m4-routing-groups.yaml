@@ -1,0 +1,25 @@
+# m4 — 「路由组」独立页（80ae904c2，2026-11-06 进 48h 窗口）：路由组从 Routing
+# 页拆出，有自己的导航项与工具栏（新建组/导入；有组时另有筛选、N 个组 · M 个开启、
+# 模板、选择）。本 flow 验证：导航可达、工具栏渲染、组编辑器开合（不落任何保存）。
+url: ${MAGPIE_URL}
+---
+- launchApp
+- extendedWaitUntil:
+    visible: '供应商'
+    timeout: 30000
+- tapOn: '路由组'
+- extendedWaitUntil:
+    # 侧边导航（≥1024px 即侧栏布局）里的独立项；1280 宽窗口必为侧栏
+    visible: '新建组'
+    timeout: 20000
+- tapOn: '新建组'
+- extendedWaitUntil:
+    # 组编辑器打开，底部有取消（保存按钮是「添加」，不点）
+    visible: '取消'
+    timeout: 10000
+- tapOn: '取消'
+- extendedWaitUntil:
+    # 编辑器收起后回到列表页
+    visible: '新建组'
+    timeout: 10000
+- takeScreenshot: m4-routing-groups

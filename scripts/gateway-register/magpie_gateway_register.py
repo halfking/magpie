@@ -339,6 +339,7 @@ def cmd_register(args):
                "base_url": base_url, "protocol": "openai-completions",
                "catalog_code": "__custom__", "notes": notes}
     existing = gw.find_by_code(code)
+    base_drifted = False
     if existing:
         pid = existing["id"]
         log("provider exists: id=%s code=%s (幂等: 重复注册收敛为 PATCH)" % (pid, code))
@@ -350,6 +351,7 @@ def cmd_register(args):
         cur_url = existing.get("base_url") or ""
         if cur_url != base_url:
             patch["base_url"] = base_url
+            base_drifted = True
             st, body = gw.api("PATCH", "/api/providers/%s" % pid, patch)
             log("base_url drift %s → %s : PATCH %s" % (cur_url, base_url, st))
         else:
@@ -383,7 +385,11 @@ def cmd_register(args):
             #表现成 auth_failed（第三轮 99027 的坑）。幂等复跑时把这类凭据轮转到
             #当前 key；rotate 要在绑定之后做（rotate-primary-key 需要一个已绑模型名
             #做探针），先记下来。
-            if (cred.get("availability_state") or "") == "auth_failed":
+            #第八轮补充：base_url 本次漂移（节点换了 IP/端口）时，凭据里存的
+            #caller key 属于旧部署，探针的 ready 多半是漂移前的陈状态，等不到
+            #auth_failed 再轮转——流量会一直打到别的候选（本轮 :3427 实测）。
+            #所以漂移轮里 existing 凭据一律进 rotate 队列。
+            if (cred.get("availability_state") or "") == "auth_failed" or base_drifted:
                 rotate_needed.append((cid, label))
         else:
             st, body = gw.api("POST", "/api/providers/%s/credentials" % pid,
@@ -435,17 +441,29 @@ def cmd_register(args):
     bind_models(cid, std_models)
     bind_models(trial_cid, trial_models)
 
-    #4) key 漂移自愈：auth_failed 的既有凭据轮转到当前 caller key（探针需要
-    #一个已绑模型名，所以放在绑定之后）。rotate 会触发一次绑定 refresh，
-    #BINDINGS_AFTER 在其后读数才算数。
+    #4) key 漂移自愈：auth_failed 或 base_url 漂移轮的既有凭据轮转到当前
+    #caller key（探针需要一个已绑模型名，所以放在绑定之后）。rotate 会触发
+    #一次绑定 refresh，BINDINGS_AFTER 在其后读数才算数。
+    #第八轮补充：rotate 只改库，数据面（URSM）内存快照仍持旧 key，请求会以
+    #401 打到新 base_url 再回落别的候选（:3427 实测，节点日志三连拒）——
+    #rotate 后按凭据 force_enable 一次，把 cmb/URSM/node_probe 一并刷新。
+    #该凭据的全部绑定会被置 available：本脚本只绑想绑的模型，可接受；
+    #对 SQL 手工收窄过的老凭据不要跑本路径（round-6-B 的告诫仍适用）。
     all_bound = std_models + trial_models
     for rcid, rlabel in rotate_needed:
         probe_model = all_bound[0] if all_bound else "zcode/GLM-5.3"
         st, body = gw.api("POST", "/api/providers/%s/credentials/%s/rotate-primary-key" % (pid, rcid),
                 {"api_key": args.magpie_caller_key, "raw_model_name": probe_model})
-        log("credential %s (%s) auth_failed → rotate primary key: HTTP %s %s"
+        log("credential %s (%s) drift/auth_failed → rotate primary key: HTTP %s %s"
             % (rcid, rlabel, st, json.dumps(body, ensure_ascii=False)[:120]))
         evidence("KEY_ROTATE_" + rlabel.upper().replace("-", "_"), str(st))
+        if st in (200, 201, 202):
+            st2, body2 = gw.api("PATCH", "/api/routing/emergency-repair",
+                    {"credential_id": rcid, "action": "force_enable",
+                     "reason": "register: rotated caller key needs data-plane refresh (%s)" % rlabel})
+            log("credential %s data-plane refresh: HTTP %s %s"
+                % (rcid, st2, json.dumps(body2, ensure_ascii=False)[:120]))
+            evidence("DATA_PLANE_REFRESH_" + rlabel.upper().replace("-", "_"), str(st2))
 
     all_live = set()
     for target in (cid, trial_cid):
