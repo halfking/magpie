@@ -103,8 +103,13 @@ SIGKILL (Code Signature Invalid / Launch Constraint Violation)，ad-hoc 重签
 --code magpie-zcode --magpie http://192.168.31.36:3426`；quota 子命令的
 --magpie-config-dir 要指到含 quotas.json 的 **magpie 目录本身**。
 
-.19（192.168.31.19，lanzheng）：**部署被阻**。机器是 Windows（IIS/10.0 +
-SMB/RPC），22/5985/5986 全关，445 的 SMB 用提供的 lanzheng 账号登录返回
-STATUS_LOGON_FAILURE（含大小写/域变体）。windows/amd64 部署包已备好
-（magpie-windows-amd64.exe 49fd3e47），开通 SSH/WinRM 或给出可用凭据后按
-.36 流程重放。
+.19（192.168.31.19，lanzheng）：**部署被阻——凭据不匹配，非账号锁定**。机器是
+Windows（IIS/10.0 + SMB/RPC）。2026-11-06上午22端口已开（Windows OpenSSH），
+但 `86133@192.168.31.19` 用89935400密码 SSH被拒（publickey,password,
+keyboard-interactive 全试）；40 分钟内5次重试（含10 分钟间隔避开锁定窗口）
+全部 denied。SMB(445)交叉验证：86133/lanzheng/Lanzheng/Administrator ×
+89935400 全部返回 **STATUS_LOGON_FAILURE（0xc000006d，凭据错误）**而非
+STATUS_ACCOUNT_LOCKED_OUT（0xc0000234，锁定）——**密码本身不对**，不是锁
+定。windows/amd64部署包已备好（magpie-windows-amd64.exe49fd3e47 +
+start-magpie.cmd，便携模式 data/布局，`MAGPIE_ADDR=0.0.0.0:3426`），拿到
+正确凭据后按 .36 流程重放即可。
