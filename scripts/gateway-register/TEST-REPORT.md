@@ -157,3 +157,33 @@ magpie 吃上游错→凭据熔断连带 glm。SQL 收窄回 5 个 zcode GLM（D
 200）；需求4✅（quota patch-200；usage 200/200）。
 `.36` 重部署证据：`go version -m` → `v0.1.1480-…-5d3c646442ee`，:3426 → 200，
 新二进制 LaunchAgent（serve）无 Launch Constraint 问题（非 GUI app）。
+
+##2026-11-06 第四轮：trial 优先 +均衡调度
+
+目标："优先使用 trial 的用量，注意并发限制，均衡调度"。改动全在网关库配置
+（无代码变更），机制对齐 `CompareCandidatePriority` 的排序契约：
+priority 桶（ `cmb.priority=TRUE 且 quota ok`）> billing round（free=1 在按量前）
+> CompositeScore > manual_priority > tier > credential_id；规划期对
+`candidateSaturatedLive`（in-flight ≥ concurrency_limit）的候选跳过。
+
+**1) 绑定收窄 +防放大**：99027 的绑定被整点 discovery 每轮重新 INSERT
+放大回 266（`UpsertCredentialModel` 的 INSERT 不走 manual% 守卫）。DELETE
+会复活——改用"保留行 + available=FALSE + unavailable_reason=manual-* +
+admin_protected=TRUE"（261 行），discovery 的 UPDATE 分支被 `manual%`
+前缀与 `admin_protected` 双守卫拦住（连 updated_at 都不碰）。
+注意：`emergency-repair force_enable` 会无差别把**所有**绑定置
+available（99027 实测 cmb_rows_updated=266）——收窄后禁用此动作，99027 的
+`suspended/periodic_exhausted` 自行恢复（窗口重置即 ready）。
+
+**2) trial/GLM 优先**：两个 magpie 凭据的 5 个 zcode GLM 绑定
+`priority=TRUE` + manual_priority 错开：trial
+（99027=1,99030=2）、glm-5.3（99027=2,99030=1）、flash/5.2/turbo=3。生效后
+resolve：**trial rank1=99027/rank2=99030（唯一两候选）**；glm-5.3 rank1/2
+=两个 magpie（第三方全在其后）；glm-5.3-flash 在 NVIDIA NIM
+（运维置顶 prio1/2/3）之后的第4位（prio=3 同档，NIM 挂了立即顶上）。
+
+**3) 并发对齐**：99027/99030 `concurrency_limit` 20→3、fp_slot_limit 20→3
+（magpie lane zcode=3）。6 并发实测：5/6 成功，单凭据排队生效
+（5.6–48s），1 发 503 为排队超时（快速失败合理）。
+.36 的 zcode 5h 窗口耗尽（1308，18:54 重置）时网关自动全量
+回落 .30——均衡调度按"试遍候选"语义工作正常，窗口恢复后自然分担。
