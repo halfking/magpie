@@ -537,3 +537,38 @@ magpie 的 flash 候选，热备是活的）；glm-5.2 / glm-5-turbo 200（1.0~1
 仍需要它）——今后凡用 SQL 收窄 magpie 绑定，记得对**保留行**回解
 admin_protected，否则该模型会再从发现列表消失；99030 解保护后整点
 discovery 可能补灌本机目录其余 8 个模型（本就由该节点真实服务，属预期）。
+##2026-11-07 第八轮-B：.19 安装位上的 Start Plan 感知核查 + 免费额度同步完善
+
+**核查结论：感知完整。** 本地 ZCode 的 Start Plan（gift）在五层一致呈现：
+① 安装位节点 /v1/models 5 个 `zcode/*` 模型（含 GLM-5.3-Flash-Trial）；② 用量
+页（m2 PASS）ZCode 卡三窗口：5 小时 74/2000、每周 10000/10000（已满，11-11
+17:16 重置）、**GLM-5.3-Flash-Trial · ZCODE WEEKEND BUILD**（免费桶）+ 走势；
+③ `/v1/magpie/quotas` 同数；④ 网关 provider notes 的 quota_snapshot 同数；
+⑤ 直接重放 ZCode 平台侧 `GET zcode.z.ai/api/v1/zcode-plan/billing/balance`
+（解密 ~/.zcode 会话 JWT + X-Device-Mid）核对：账号当前**唯一**活动计划
+`ZCODE WEEKEND BUILD`（zcode-v3-start-plan-1106-wk），唯一桶
+`model:glm-5.3-flash` remaining **422,178,128 / 500,000,000**（与卡片同源），
+无其它隐藏桶/模型——插件把桶模型以 `-Trial` 别名暴露，magpie 侧无漏。
+
+**免费额度的可用性**：桶周末全天放量（starts 11-06 18:00，ends 11-09 09:00
+北京——round-3 的"夜间桶白天不放量"已被此计划取代）；三节点 trial 凭据
+99032/99033/99035 全部 ready（9 并发车道），E2E 200；STD 桶（99034）因周配额
+耗尽 suspended 至 11-11，属上游约束。免费 token 只能经 `-Trial` 模型名消耗：
+ZCode IDE 本体（当前最大消耗源）、llm.itestu.cn 公开模型 `glm-5.3-flash-trial`、
+本机 agent 接 magpie 的 `zcode/GLM-5.3-Flash-Trial`。
+
+**完善（本轮落地）**：
+1. **常驻余量同步**：安装位新增 `sync_gateway_quota.py`（读 gitignored 密钥、
+   调 register 脚本 quota 子命令、日志落 `data\quota-sync.log` >1MB 自截断），
+   注册 Windows 计划任务 **`magpie-gateway-quota-sync`**（每小时，
+   `schtasks /Run` 实测链路通）——网关 UI 的免费额度余量从此自动保鲜。
+2. 快照即时刷新：trial 已用 78.5M/500M（15.7%，随本 IDE 会话与网关流量增长）。
+3. 安装位节点上 m2 复跑 PASS（部署迁移后测试链路完好）。
+4. **同步 supplement 的 admin_protected 可见性教训**：本节点 99034 的 4 个
+   STD GLM 保留行与 99035 的 trial 保留行 `admin_protected` 已清（discovery
+   列表可见），禁用行保留 `manual-*`+`admin_protected` 双守卫。期间发现 99035
+   的 STD 行曾被某环节重新置 available（02:21 后）——已恢复 trial-only 隔离
+   （avail=1），若再次复发需查网关 auto-recovery 对守卫的绕过。
+   复验：第三方 `/v1/models?scope=all` 列全 GLM 家族（809 模型，trial 在列）；
+   trial E2E 200（40.3s，audit provider=95464 credential=99035）。
+>>>>>>> 91bd6c70c (docs: round eight — Start Plan perception verified to the bucket, quota sync runs hourly)
