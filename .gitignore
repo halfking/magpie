@@ -9,3 +9,4 @@
 .DS_Store
 .codegraph/
 .deployment-validation/
+/internal/update/launcher-*.com

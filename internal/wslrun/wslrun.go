@@ -37,6 +37,7 @@ type Tool struct {
 	Mount  string // where Windows' drives are mounted: "/mnt/"
 	Host   string // the Windows host's address inside the distro, "" when it is 127.0.0.1 (HostLoopback)
 	Root   bool   // the distro's default user, as whom the command runs, is root
+	Home   string // that user's home folder, inside the distro
 }
 
 // On is whether there is WSL to look in: on Windows, or in tests.
@@ -259,7 +260,7 @@ func probeScript(name string) string {
 		`case "$p" in /mnt/*|"") continue;; esac; ` +
 		`[ -x "$p" ] && { echo "bin:$p"; ` +
 		`echo "path:$(bash -ic 'echo $PATH' 2>/dev/null </dev/null | tail -n1)"; echo "lpath:$PATH"; break; }; done; ` +
-		`echo "mount:$(wslpath -u 'C:\' 2>/dev/null)"; echo "uid:$(id -u)"; ` +
+		`echo "mount:$(wslpath -u 'C:\' 2>/dev/null)"; echo "uid:$(id -u)"; echo "home:$HOME"; ` +
 		`ip route show default 2>/dev/null | head -n1 | sed 's/^/route:/'; ` +
 		`command -v wslinfo >/dev/null 2>&1 && echo "net:$(wslinfo --networking-mode 2>/dev/null)"; true`
 }
@@ -296,6 +297,10 @@ func parseProbe(distro, out string) (Tool, bool) {
 			net_ = strings.ToLower(v)
 		case "uid":
 			t.Root = v == "0"
+		case "home":
+			if strings.HasPrefix(v, "/") {
+				t.Home = v
+			}
 		}
 	}
 	if !strings.HasPrefix(t.Path, "/") {
@@ -311,10 +316,72 @@ func parseProbe(distro, out string) (Tool, bool) {
 	if dir := t.Path[:strings.LastIndex(t.Path, "/")]; dir != "" && !onPath(t.PATH, dir) {
 		t.PATH = dir + ":" + t.PATH
 	}
-	if HostLoopback(net_) {
-		t.Host = ""
-	}
+	t.Host = HostAt(net_, t.Host, Nets())
 	return t, true
+}
+
+// Nets are the networks Windows has an address on that WSL distros reach
+// it through: the IPv4 addresses of its vEthernet (WSL…) adapters (NAT's
+// "vEthernet (WSL)" or "vEthernet (WSL (Hyper-V firewall))", a bridged
+// switch's "vEthernet (WSL_Bridge_Switch)"), there while WSL's VM runs.
+// None off Windows. A var for the tests.
+var Nets = nets
+
+func nets() []*net.IPNet {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, i := range ifs {
+		if i.Flags&net.FlagUp == 0 || !strings.Contains(i.Name, "(WSL") {
+			continue
+		}
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLinkLocalUnicast() {
+				out = append(out, n)
+			}
+		}
+	}
+	return out
+}
+
+// HostAt is the address a distro in networking mode reaches Windows at,
+// from its default route's next hop (route) and the networks Windows has
+// on WSL's adapters (nets, Nets): "" where its 127.0.0.1 is Windows'
+// (HostLoopback). Under NAT the next hop is Windows' address on
+// vEthernet (WSL) itself, and is kept. Under bridged networking the
+// distro is a peer on the LAN and its next hop is the LAN's router
+// (192.168.9.1, ecalpal_ on Discord), not Windows: Windows is at its own
+// address on the bridge's adapter, the one whose network holds that
+// router. A next hop on no WSL network is kept as it was: NAT's
+// vEthernet (WSL) can be up beside a bridge on another subnet, and is
+// not where a bridged distro reaches Windows.
+func HostAt(mode, route string, nets []*net.IPNet) string {
+	if HostLoopback(mode) {
+		return ""
+	}
+	ip := net.ParseIP(route)
+	if ip == nil {
+		return route
+	}
+	var in []*net.IPNet
+	for _, n := range nets {
+		if n.IP.Equal(ip) {
+			return route // Windows' own: NAT's
+		}
+		if n.Contains(ip) {
+			in = append(in, n)
+		}
+	}
+	if len(in) == 1 {
+		return in[0].IP.String()
+	}
+	return route
 }
 
 // HostLoopback reports whether 127.0.0.1 inside a WSL 2 distro reaches
@@ -392,6 +459,10 @@ var runSeq struct {
 	n int
 }
 
+// Args is Command's arguments to wsl.exe, without what Command adds to end
+// the run with ctx: for a program that starts wsl.exe itself.
+func (t Tool) Args(args ...string) []string { return t.argv(args) }
+
 func (t Tool) argv(args []string) []string {
 	runSeq.Lock()
 	runSeq.n++
@@ -412,6 +483,12 @@ func (t Tool) Linux(win string) string {
 		mount = "/mnt/"
 	}
 	return mount + strings.ToLower(win[:1]) + "/" + strings.TrimPrefix(rest, "/")
+}
+
+// Windows is where path linux inside the distro is on Windows:
+// \\wsl$\<distro>\home\me for /home/me.
+func (t Tool) Windows(linux string) string {
+	return `\\wsl$\` + t.Distro + strings.ReplaceAll(linux, "/", `\`)
 }
 
 func isLetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }

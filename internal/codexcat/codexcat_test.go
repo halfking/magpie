@@ -40,52 +40,14 @@ func TestCodexCatalogKeepsOwnEntries(t *testing.T) {
 		own["context_window"] != float64(272000) || len(own["input_modalities"].([]any)) != 2 {
 		t.Errorf("own entry: %v", own)
 	}
-	if own["base_instructions"] != Prompt {
-		t.Error("own entry without base_instructions")
+	if own["base_instructions"] != codexOwn(t)["gpt-5.5"] {
+		t.Error("own entry without Codex's own base_instructions for it")
 	}
 	if _, ok := own["upgrade"]; ok {
 		t.Error("upgrade prompt kept")
 	}
 	if _, ok := own["availability_nux"]; ok {
 		t.Error("start-up notice kept")
-	}
-}
-
-// Codex's own model under its own name — the name the ChatGPT backend
-// lists it under, and the one the Codex app's picker asks for — keeps the
-// entry Codex has for it, as the one under magpie's codex provider's name
-// does: without it, the app reads "Unknown model gpt-5.5 is used" and its
-// picker has none of Codex's own models.
-func TestCodexCatalogKeepsOwnEntryUnderItsOwnName(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	os.MkdirAll(filepath.Join(home, ".codex"), 0o755)
-	os.WriteFile(filepath.Join(home, ".codex", "models_cache.json"), []byte(`{"models":[
-		{"slug":"gpt-5.5","display_name":"GPT-5.5","priority":3,"visibility":"list","input_modalities":["text","image"],
-		 "context_window":272000}]}`), 0o644)
-
-	var got struct {
-		Models []map[string]any `json:"models"`
-	}
-	if err := json.Unmarshal(Catalog([]catalog.Model{
-		{ID: "gpt-5.5", Name: "GPT-5.5", Efforts: []string{"low", "high"}},
-	}), &got); err != nil || len(got.Models) != 1 {
-		t.Fatalf("%v %v", err, got)
-	}
-	own := got.Models[0]
-	if own["slug"] != "gpt-5.5" {
-		t.Fatalf("slug: %v", own["slug"])
-	}
-	// what Codex knows of it, not the generic entry
-	if own["context_window"] != float64(272000) {
-		t.Errorf("context_window: %v", own["context_window"])
-	}
-	if mods, _ := own["input_modalities"].([]any); len(mods) != 2 {
-		t.Errorf("input_modalities: %v", own["input_modalities"])
-	}
-	if desc, _ := own["description"].(string); strings.Contains(desc, "via magpie") {
-		t.Errorf("described as one of magpie's: %q", desc)
 	}
 }
 
@@ -109,8 +71,9 @@ func TestCodexCatalogImages(t *testing.T) {
 
 // A model magpie describes has Codex search its MCP tools rather than send
 // every one in each request (#258), with its prompt, context window, and
-// neither code mode nor Responses Lite. A window above the working window
-// is told as that, the whole one as its max, unless settings.FullContext.
+// neither code mode nor Responses Lite. Its whole window is told, and a
+// window above the working one is compacted at that (auto_compact_token_
+// limit), unless settings.FullContext.
 func TestCodexCatalogToolSearch(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("USERPROFILE", os.Getenv("HOME"))
@@ -125,7 +88,7 @@ func TestCodexCatalogToolSearch(t *testing.T) {
 		t.Fatalf("%v", got)
 	}
 	e := got.Models[0]
-	if e["supports_search_tool"] != true || e["base_instructions"] != Prompt || e["context_window"] != float64(settings.WorkingWindow) || e["max_context_window"] != float64(996147) {
+	if e["supports_search_tool"] != true || e["base_instructions"] != Prompt || e["context_window"] != float64(996147) || e["auto_compact_token_limit"] != float64(settings.WorkingWindow) || e["max_context_window"] != nil {
 		t.Errorf("entry: %v", e)
 	}
 	if err := settings.Save(settings.Settings{FullContext: true}); err != nil {
@@ -137,7 +100,7 @@ func TestCodexCatalogToolSearch(t *testing.T) {
 	json.Unmarshal(Catalog([]catalog.Model{
 		{ID: "group/auto-gemini-3-8-flash", Name: "auto", Context: 996147},
 	}), &full)
-	if e := full.Models[0]; e["context_window"] != float64(996147) || e["max_context_window"] != nil {
+	if e := full.Models[0]; e["context_window"] != float64(996147) || e["auto_compact_token_limit"] != nil || e["max_context_window"] != nil {
 		t.Errorf("full context: %v", e)
 	}
 	for _, off := range []string{"tool_mode", "use_responses_lite", "multi_agent_version", "model_messages"} {

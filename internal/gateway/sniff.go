@@ -26,8 +26,13 @@ type usageSniffer struct {
 	// failed: what an explicit error event said; a terminal event can end
 	// the stream successfully or with a failure despite its HTTP 200.
 	failed string
+	// failedNamed: the status the error frame named for itself, when it
+	// named one (#4855); 0 when it didn't
+	failedNamed int
 	// tail: what a Chat stream's chunks say of its end (chatTail)
 	tail chatTail
+	// found: the searches the reply ran by itself (searchTally)
+	found searchTally
 }
 
 func newSniffer(proto provider.Protocol, contentType string) *usageSniffer {
@@ -124,8 +129,12 @@ func (s *usageSniffer) parse(b []byte) {
 			}
 			s.failed = provider.APIError(body, "upstream stream failed")
 			s.u.ErrType = provider.ErrorType(body)
+			if body != nil {
+				s.failedNamed = namedStatus(body)
+			}
 		}
 	}
+	s.found.see(s.proto, b)
 	if up := upstreamOf(b); up != "" {
 		s.u.Upstream = up
 	}
@@ -268,6 +277,19 @@ func (s *usageSniffer) drain() {
 	}
 }
 
+// settleWhole reads a reply that came whole, once it has ended, for an
+// error it carried under its success status (errorReply): told as failed,
+// with what it said, not counted as an answer.
+func (s *usageSniffer) settleWhole() {
+	if s.sse || s.over || s.failed != "" {
+		return
+	}
+	if _, msg, ok := errorReply(s.buf); ok {
+		s.failed = msg
+		s.u.ErrType = provider.ErrorType(bytes.TrimSpace(s.buf))
+	}
+}
+
 // usage is what the reply reported, the model it named in Served; call it
 // once the body has ended.
 func (s *usageSniffer) usage() Usage {
@@ -278,5 +300,6 @@ func (s *usageSniffer) usage() Usage {
 	}
 	u := s.u
 	u.Served = s.served
+	u.searches = s.found.count()
 	return u
 }

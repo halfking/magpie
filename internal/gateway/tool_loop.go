@@ -98,7 +98,7 @@ const tailItems = 8 * toolLoopRepeats
 // took ~30ms and 20MB a turn of 1.5MB; gjson finds the items without
 // decoding them. A body whose conversation isn't such a list is as it came.
 func tailOf(from provider.Protocol, body []byte) []byte {
-	list := gjson.GetBytes(body, conversationKey[from])
+	list := getIn(body, conversationKey[from])
 	if !list.IsArray() || list.Index <= 0 {
 		return body
 	}
@@ -110,19 +110,19 @@ func tailOf(from provider.Protocol, body []byte) []byte {
 	if len(items) <= tailItems {
 		return body
 	}
-	var b bytes.Buffer
-	b.Grow(len(body) - list.Index - len(list.Raw) + items[len(items)-1].Index + len(items[len(items)-1].Raw) - items[len(items)-tailItems].Index + list.Index + 2)
-	b.Write(body[:list.Index])
-	b.WriteByte('[')
+	// a slice made to its size, not a bytes.Buffer: under -race the
+	// Buffer's Grow allocates its slice twice
+	b := make([]byte, 0, len(body)-list.Index-len(list.Raw)+items[len(items)-1].Index+len(items[len(items)-1].Raw)-items[len(items)-tailItems].Index+list.Index+2)
+	b = append(b, body[:list.Index]...)
+	b = append(b, '[')
 	for i, v := range items[len(items)-tailItems:] {
 		if i > 0 {
-			b.WriteByte(',')
+			b = append(b, ',')
 		}
-		b.WriteString(v.Raw)
+		b = append(b, v.Raw...)
 	}
-	b.WriteByte(']')
-	b.Write(body[list.Index+len(list.Raw):])
-	return b.Bytes()
+	b = append(b, ']')
+	return append(b, body[list.Index+len(list.Raw):]...)
 }
 
 // toolLoop is a conversation's newest exchange and how many turns in a row
@@ -140,6 +140,9 @@ func toolLoopOf(msgs []Message) (toolLoop, bool) {
 		return toolLoop{}, false
 	}
 	last := turns[len(turns)-1]
+	if allWaits(last.calls) {
+		return toolLoop{}, false
+	}
 	n := 0
 	for i := len(turns) - 1; i >= 0 && turns[i].sum == last.sum; i-- {
 		n++
@@ -148,6 +151,76 @@ func toolLoopOf(msgs []Message) (toolLoop, bool) {
 		return toolLoop{}, false
 	}
 	return toolLoop{calls: last.calls, turns: n}, true
+}
+
+// A call made to wait (clock__sleep {"duration_ms":60000} while CI runs)
+// is asked again with the same arguments and answered the same by design;
+// the time it takes is the progress, which a request doesn't carry. A turn
+// whose calls are all waits is never a loop. A turn that waits and also
+// runs another call is judged as before.
+
+// waitWords are the words in a tool's name that make it a wait.
+var waitWords = map[string]bool{"sleep": true, "wait": true, "delay": true, "pause": true, "poll": true}
+
+// durationKeys are the argument names of a bare wait.
+var durationKeys = map[string]bool{"duration": true, "duration_ms": true, "duration_s": true, "duration_seconds": true, "ms": true, "milliseconds": true, "seconds": true, "secs": true, "sec": true, "timeout": true, "timeout_ms": true, "delay": true, "delay_ms": true, "minutes": true}
+
+func allWaits(calls []Part) bool {
+	for _, c := range calls {
+		if !isWait(c) {
+			return false
+		}
+	}
+	return len(calls) > 0
+}
+
+// isWait: the tool's own name (after any server__ or namespace prefix, so
+// a server called "wait" doesn't make its tools waits) has a wait word, or
+// its arguments are only a duration.
+func isWait(c Part) bool {
+	name := c.Name
+	for _, sep := range []string{"__", ".", "/", ":"} {
+		if i := strings.LastIndex(name, sep); i >= 0 {
+			name = name[i+len(sep):]
+		}
+	}
+	// split on anything but a letter, and before a capital (waitForCi)
+	var words []string
+	cur := []rune{}
+	flush := func() {
+		if len(cur) > 0 {
+			words = append(words, strings.ToLower(string(cur)))
+			cur = cur[:0]
+		}
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			flush()
+			cur = append(cur, r)
+		case r >= 'a' && r <= 'z':
+			cur = append(cur, r)
+		default:
+			flush()
+		}
+	}
+	flush()
+	for _, w := range words {
+		if waitWords[w] {
+			return true
+		}
+	}
+	var args map[string]json.RawMessage
+	if json.Unmarshal(c.Args, &args) != nil || len(args) == 0 {
+		return false
+	}
+	for k, v := range args {
+		var n float64
+		if !durationKeys[strings.ToLower(k)] || json.Unmarshal(v, &n) != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // exchange is one turn of tool use: the assistant's calls and the results

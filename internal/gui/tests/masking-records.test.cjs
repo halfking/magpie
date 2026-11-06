@@ -22,6 +22,9 @@ const { chromium, webkit } = require("playwright");
 const assets = path.resolve(__dirname, "../assets");
 const KEY = "{{API_KEY_aaaa1111}}", NAME = "{{PERSON_bbbb2222}}", MAIL = "{{EMAIL_cccc3333}}", PK = "{{PRIVATE_KEY_dddd4444}}";
 const SECRET = "sk-proj-abcdEFGH1234ijkl", ADDR = "ann@example.com";
+// a record's key is its time in nanoseconds, past what a JS number holds
+// exactly, so the API gives it as a string
+const K1 = "1792987654321000001", K2 = "1792987654321000002", K3 = "1792987654321000003", K5 = "1792987654321000005";
 
 function day(back) {
   const d = new Date();
@@ -47,26 +50,27 @@ function summary(days) {
   };
 }
 const filler = "x".repeat(900);
-// the body 1002 went out with: a long system prompt nothing was masked in,
+// the body K2 went out with: a long system prompt nothing was masked in,
 // and a user message with two values
 const SENT = JSON.stringify({ model: "claude-opus-4-1", system: "You are Claude Code. " + filler, messages: [
   { role: "user", content: [{ type: "text", text: "earlier, unchanged" }] },
   { role: "user", content: [{ type: "text", text: `export OPENAI_API_KEY=${KEY} # mail ${MAIL}, again ${KEY}` }] },
 ] });
 const records = [
-  { key: 1003, t: ago(60e3), route: "messages", what: "chat", agent: "claude", provider: "anthropic", model: "claude-opus-4-1", n: 1, blocked: true,
+  { key: K3, t: ago(60e3), route: "messages", what: "chat", agent: "claude", provider: "anthropic", model: "claude-opus-4-1", n: 1, blocked: true,
     values: [{ p: PK, k: "PRIVATE_KEY", b: "rule", h: "b3Bl", l: 400, n: 1, a: "block" }],
     snips: { [PK]: `-----BEGIN OPENSSH PRIVATE KEY----- ${PK}` } },
-  { key: 1002, t: ago(120e3), route: "messages", what: "chat", agent: "claude", provider: "anthropic", model: "claude-opus-4-1", n: 3, took: 1800, back: { [KEY]: 1 },
+  { key: K2, t: ago(120e3), route: "messages", what: "chat", agent: "claude", provider: "anthropic", model: "claude-opus-4-1", n: 3, took: 1800, back: { [KEY]: 1 },
     values: [{ p: KEY, k: "API_KEY", b: "rule", h: "sk-p", l: 24, n: 2, known: true }, { p: MAIL, k: "EMAIL", b: "rule", h: "a", l: 15, n: 1, known: true }],
     snips: { [KEY]: `export OPENAI_API_KEY=${KEY} # mail ${MAIL}`, [MAIL]: `…_KEY=${KEY} # mail ${MAIL}` } },
   // from before a restart: no body, no values in memory
-  { key: 1001, t: ago(300e3), route: "search", what: "search", agent: "codex", provider: "openai", model: "gpt-5", n: 1,
+  { key: K1, t: ago(300e3), route: "search", what: "search", agent: "codex", provider: "openai", model: "gpt-5", n: 1,
     values: [{ p: NAME, k: "PERSON", b: "model", h: "", l: 3, n: 1 }], snips: { [NAME]: `ask ${NAME} about it` } },
 ];
 
 function serve(lang, sum, asked, opts = {}) {
   const settings = { theme: "light", lang, tray: "panel", currency: "usd", redact: !opts.off, redactPersonal: !opts.off, redactActions: { PRIVATE_KEY: "block" }, ...opts.settings };
+  let cleared = false;
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
     const json = (data) => route.fulfill({ json: data });
@@ -84,29 +88,39 @@ function serve(lang, sum, asked, opts = {}) {
     }
     if (url.pathname === "/api/providers") return json({ providers: [{ id: "anthropic", name: "Anthropic", icon: "anthropic", agents: [], models: [] }, { id: "openai", name: "OpenAI", icon: "openai", agents: [], models: [] }], presets: [], excluded: [],
       gateway: { running: true, window: true, mine: true, url: "http://127.0.0.1:3999", models: 0, groups: [],
-        calls: [{ id: 7, time: ago(120e3), agent: "claude", model: "claude-opus-4-1", from: "anthropic", to: "anthropic", status: 200, ms: 900, masked: { n: 3, distinct: 2, kinds: { API_KEY: 2, EMAIL: 1 }, by: { rule: 2 }, key: 1002 } },
-          { id: 8, time: ago(60e3), agent: "claude", model: "claude-opus-4-1", from: "anthropic", to: "anthropic", status: 200, ms: 700, masked: { n: 0, distinct: 0, warned: 2, key: 1003 } }] } });
+        calls: [{ id: 7, time: ago(120e3), agent: "claude", model: "claude-opus-4-1", from: "anthropic", to: "anthropic", status: 200, ms: 900, masked: { n: 3, distinct: 2, kinds: { API_KEY: 2, EMAIL: 1 }, by: { rule: 2 }, key: K2 } },
+          { id: 8, time: ago(60e3), agent: "claude", model: "claude-opus-4-1", from: "anthropic", to: "anthropic", status: 200, ms: 700, masked: { n: 0, distinct: 0, warned: 2, key: K3 } }] } });
     if (url.pathname === "/api/groups") return json({ groups: [], models: [] });
     if (url.pathname === "/api/plugins") return json({ plugins: [] });
     if (url.pathname === "/api/privacy-model") return json({ supported: true, installed: false, size: 1.6e9 });
-    if (url.pathname === "/api/masking/summary") return json(sum(+url.searchParams.get("days")));
+    if (url.pathname === "/api/masking/clear") {
+      asked.push("clear " + req.method());
+      if (opts.clearFails) return route.fulfill({ status: 500, body: "remove 2026-10-26.jsonl: permission denied" });
+      cleared = true;
+      return json({ cleared: true });
+    }
+    if (url.pathname === "/api/masking/summary") {
+      const s = sum(+url.searchParams.get("days"));
+      return json(cleared ? { ...s, days: s.days.map((d) => ({ ...d, requests: 0, n: 0, distinct: 0 })), requests: 0, n: 0, distinct: 0, blocked: 0, kinds: [], by: {}, agents: [], providers: [], values: [] } : s);
+    }
     if (url.pathname === "/api/masking/records") {
       asked.push(url.search);
       const q = url.searchParams, kinds = q.get("kind")?.split(",");
-      const rs = (opts.none ? [] : records).filter((r) => (!kinds || r.values.some((v) => kinds.includes(v.k))) && (!q.get("by") || r.values.some((v) => v.b === q.get("by")))
+      const rs = (opts.none || cleared ? [] : opts.records || records).filter((r) => (!kinds || r.values.some((v) => kinds.includes(v.k))) && (!q.get("by") || r.values.some((v) => v.b === q.get("by")))
         && (!q.get("agent") || r.agent === q.get("agent")) && (!q.get("provider") || r.provider === q.get("provider")) && (!q.get("blocked") || r.blocked));
       return json({ records: rs, more: false });
     }
     if (url.pathname === "/api/masking/record") {
-      const r = records.find((r) => r.key === +url.searchParams.get("key"));
+      const r = (opts.records || records).find((r) => r.key === url.searchParams.get("key"));
       return r ? json(r) : route.fulfill({ status: 404, body: "404 page not found" });
     }
     if (url.pathname === "/api/masking/sent") {
       asked.push("sent " + url.searchParams.get("key"));
-      return url.searchParams.get("key") === "1002" ? json({ body: SENT }) : route.fulfill({ status: 404, body: "404 page not found" });
+      const body = opts.sent ? opts.sent[url.searchParams.get("key")] : url.searchParams.get("key") === K2 && SENT;
+      return body ? json({ body }) : route.fulfill({ status: 404, body: "404 page not found" });
     }
     if (url.pathname === "/api/masking/values") {
-      const known = { [KEY]: SECRET, [MAIL]: ADDR };
+      const known = { [KEY]: SECRET, [MAIL]: ADDR, ...opts.known };
       const ps = JSON.parse(req.postData()).ps;
       asked.push("values " + ps.join(","));
       return json({ values: Object.fromEntries(ps.filter((p) => known[p]).map((p) => [p, known[p]])) });
@@ -124,8 +138,9 @@ function serve(lang, sum, asked, opts = {}) {
 
 async function open(engine, lang, width, sum, where, opts) {
   const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
-  const page = await (await browser.newContext({ viewport: { width, height: 1000 }, reducedMotion: "reduce" })).newPage();
+  const page = await (await browser.newContext({ viewport: { width, height: 1000 }, reducedMotion: opts?.motion ? "no-preference" : "reduce" })).newPage();
   page.setDefaultTimeout(8000);
+  page.setDefaultNavigationTimeout(60000);
   const errors = [], asked = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.route("**/*", serve(lang, sum, asked, opts));
@@ -144,7 +159,7 @@ const shot = (page, name) => process.env.MASK_SHOTS && page.screenshot({ path: p
 // English that a translated page must not show
 const english = ["Kept from vendors", "By request", "By value", "masked these on this computer", "Different values", "values masked", "Held back",
   "Request content", "How it was masked", "What happened", "Side by side", "Only the parts masking changed", "parts unchanged", "Found by", "In the answer",
-  "This request was not sent", "Mask it instead", "See the rules", "Nothing to put back", "no longer in memory", "Masked most", "Local model"];
+  "This request was not sent", "Mask it instead", "See the rules", "Nothing to put back", "no longer in memory", "never on disk", "Masked most", "Local model"];
 const untranslated = async (page, lang) => {
   if (lang === "en") return;
   const said = await page.locator("#view-masking").innerText();
@@ -163,6 +178,38 @@ async function stillClick(page, loc) {
   await loc.click();
   await page.waitForTimeout(100);
   assert.deepEqual(await scrolled(page), before, "no click moved the page");
+}
+
+// The page comes to rest while it sits open (#3185): the flow's dots, its
+// scan mark and the Live dot each play a few times when drawn. Endless,
+// the dots (SMIL) laid the page out ~700 times a second in Chromium, 16%
+// of a core and ~0.5W; in WebKit 180 wakeups a second. SMIL's clock is
+// moved on and each CSS animation's end is read, so nothing waits.
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const width of [1100, 640]) {
+    test(`${engine} ${width}px: the masking page's motion ends`, async (t) => {
+      const { browser, page, errors } = await open(engine, "en", width, summary, "", { motion: true });
+      t.after(() => browser.close());
+      const card = page.locator("#maskCard");
+      await card.locator(".mo-flow .mo-dot").first().waitFor({ state: "attached" });
+      await page.locator("#maskList .msk-live i").waitFor({ state: "attached" });
+      const rest = await page.evaluate(() => {
+        const smil = [...document.querySelectorAll("#view-masking animate, #view-masking animateMotion")];
+        for (const svg of new Set(smil.map((a) => a.ownerSVGElement))) svg.setCurrentTime(3600);
+        // WebKit keeps an ended one's start time, so only Chromium is asked
+        // the clock; both are asked each one's own timing
+        const on = smil.filter((a) => { try { a.getStartTime(); return true; } catch { return false; } }).length;
+        const forever = smil.filter((a) => ["repeatCount", "repeatDur", "dur", "end"].some((k) => a.getAttribute(k) === "indefinite") || !(+a.getAttribute("repeatCount") > 0)).length;
+        const endless = document.getAnimations().filter((a) => a.effect?.getComputedTiming().endTime === Infinity).map((a) => a.animationName || a.id || "?");
+        return { smil: smil.length, on, forever, endless };
+      });
+      assert(rest.smil > 0, "the flow moves when drawn");
+      assert.equal(rest.forever, 0, "a dot set to go round for good");
+      if (engine === "chromium") assert.equal(rest.on, 0, "an hour on, a dot still goes round");
+      assert.deepEqual(rest.endless, [], "an animation that never ends");
+      assert.deepEqual(errors, []);
+    });
+  }
 }
 
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
@@ -188,11 +235,24 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // to the ring's top left)
         const bird = await card.locator(".msk-hub svg").boundingBox();
         assert(Math.abs(bird.x + bird.width / 2 - (hub.x + hub.width / 2)) < 1 && Math.abs(bird.y + bird.height / 2 - (hub.y + hub.height / 2)) < 1, "the bird in the middle of its ring");
-        // each agent and provider with its logo, on the side the lines are
+        // each agent and provider with its logo
         assert.deepEqual(await card.locator(".mo-node .ic").evaluateAll((ns) => ns.map((n) => n.dataset.icon)), ["claudecode-color", "codex-color", "anthropic", "openai"]);
-        const agentNode = card.locator(".mo-col.agent .mo-node").first(), provNode = card.locator(".mo-col.provider .mo-node").first();
-        assert((await agentNode.locator(".ic").boundingBox()).x > (await agentNode.locator(".nm").boundingBox()).x, "an agent's logo after its name");
-        assert((await provNode.locator(".ic").boundingBox()).x < (await provNode.locator(".nm").boundingBox()).x, "a provider's logo before its name");
+        // on both sides the logo first, then the name; a side's logos in one
+        // column and its names on one edge; every logo on a disc of one size
+        // (bare, a logo that fills its box and one that doesn't read as two
+        // sizes)
+        const nodes = await card.locator(".mo-node:not(:disabled)").evaluateAll((ns) => ns.map((b) => {
+          const ic = b.querySelector(".ic").getBoundingClientRect(), nm = b.querySelector(".nm").getBoundingClientRect();
+          return { side: b.parentElement.classList.contains("agent") ? "agent" : "provider", ic: { x: ic.x, w: ic.width, h: ic.height, r: getComputedStyle(b.querySelector(".ic")).borderRadius }, nm: nm.x };
+        }));
+        for (const n of nodes) {
+          assert(n.ic.x + n.ic.w <= n.nm, `the logo before the name: ${JSON.stringify(n)}`);
+          assert.deepEqual([n.ic.w, n.ic.h, n.ic.r], [24, 24, "50%"], `one disc for every logo: ${JSON.stringify(n)}`);
+        }
+        for (const side of ["agent", "provider"]) {
+          const of = nodes.filter((n) => n.side === side);
+          assert(of.every((n) => Math.abs(n.ic.x - of[0].ic.x) < 0.5 && Math.abs(n.nm - of[0].nm) < 0.5), `${side}s' logos in one column, names on one edge: ${JSON.stringify(of)}`);
+        }
         assert.match(await card.locator(".mo-cap").textContent(), /magpie/);
         assert.equal(await page.evaluate(() => [...document.querySelectorAll("#maskCard, #maskCard *")].some((n) => /gradient/.test(getComputedStyle(n).backgroundImage))), false, "flat: no gradient");
         // short: the list starts in the first screen
@@ -240,6 +300,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await one.locator(".msk-msg").first().waitFor();
         assert.equal(await card.isHidden(), true);
         assert.equal(await one.locator(".msk-steps li").count(), 5);
+        // each step's line runs from the number before it to its own, not a dash in the gap
+        const lines = await one.locator(".msk-steps li").evaluateAll((lis) => lis.slice(1).map((li, i) => {
+          const b = getComputedStyle(li, "::before");
+          if (b.display === "none") return null;
+          const x = li.getBoundingClientRect().left + parseFloat(b.left);
+          const from = lis[i].querySelector(".msk-sdot").getBoundingClientRect(), to = li.querySelector(".msk-sdot").getBoundingClientRect();
+          return [Math.round(x - from.right), Math.round(to.left - (x + parseFloat(b.width)))];
+        }));
+        for (const l of lines) if (l) assert.deepEqual(l, [6, 6], "a line from number to number");
         assert.equal(await one.locator(".msk-msg").count(), 1, "one piece of text had values");
         assert.equal(await one.locator(".msk-fold").count(), 1, "the system prompt and the earlier message, folded as one");
         assert.deepEqual(await one.locator(".msk-msg .msk-text").last().locator("mark").allTextContents(), [KEY, MAIL, KEY], "as the vendor got it");
@@ -332,14 +401,61 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     });
     test(`${engine} ${lang}: your own words alone are masking on`, async (t) => {
       const empty = (d) => ({ ...summary(d), requests: 0, n: 0, distinct: 0, blocked: 0, kinds: [], agents: [], providers: [], values: [], by: {} });
-      const { browser, page, errors } = await open(engine, lang, 640, empty, null, { off: true, none: true, settings: { redactWords: ["Nightjar"] } });
+      const { browser, page, errors, asked } = await open(engine, lang, 640, empty, null, { off: true, none: true, settings: { redactWords: ["Nightjar"] } });
       t.after(() => browser.close());
       await page.locator("#maskCard .msk-head").waitFor();
       assert.equal(await page.locator("#maskCard.off").count(), 0, "words alone mask, the card says off");
-      assert.equal(await page.locator("#maskCard .msk-head button").count(), 0, "no Turn on masking while words mask");
+      // the way off is Settings › Privacy, where the words are: a click
+      // here that turned the switches off would leave words masking
+      const off = page.locator("#maskCard .msk-head button");
+      assert.equal(await off.count(), 1, "one way off, no Turn on masking while words mask");
+      if (lang === "en") assert.equal(await off.innerText(), "Turn off in Settings");
+      else assert(!(await off.innerText()).includes("Turn"), "Turn off in Settings left in English");
       assert(!(await page.locator("#maskCard .msk-flow-none").innerText()).includes("Only keys"), "words alone: not the secrets-only line");
+      await off.click();
+      await page.locator("#view-settings").waitFor({ state: "visible" });
+      assert(!asked.some((x) => x.startsWith("settings")), "opening Settings saves nothing");
       assert.deepEqual(errors, []);
     });
+    // masking on, the page turns it off as it turns it on (ZekeXiao on X:
+    // "脱敏好像只有一个打开开关，不能关？"): both switches go off, the page
+    // then says off, and Turn on masking brings back what was on
+    for (const width of [1100, 640]) {
+      test(`${engine} ${lang} ${width}px: masking on, the page turns it off and on again`, async (t) => {
+        const { browser, page, errors, asked } = await open(engine, lang, width, summary);
+        t.after(() => browser.close());
+        const head = page.locator("#maskCard .msk-head");
+        await page.locator("#maskCard .msk-num").waitFor();
+        const off = head.locator("button.text");
+        assert.equal(await off.count(), 1, "a way off while masking is on");
+        if (lang === "en") assert.equal(await off.innerText(), "Turn off masking");
+        else assert(!(await off.innerText()).includes("Turn"), "Turn off masking left in English");
+        assert.deepEqual(await wide(page), { page: false, over: [] });
+        await shot(page, `${engine}-${lang}-${width}-on-off`);
+        const offText = await off.innerText();
+        await stillClick(page, off);
+        await until(() => asked.some((x) => x.startsWith("settings")));
+        const sent = JSON.parse(asked.find((x) => x.startsWith("settings")).slice(9));
+        assert.equal(sent.redact, false);
+        assert.equal(sent.redactPersonal, false);
+        // what the page says after is true: off, and the way back on
+        const on = head.locator("button.text");
+        await page.waitForFunction((was) => { const b = document.querySelector("#maskCard .msk-head button.text"); return b && !b.disabled && b.textContent !== was; }, offText);
+        if (lang === "en") {
+          assert.equal(await head.locator(".msk-sub").innerText(), "Masking is off: requests go to vendors as they are");
+          assert.equal(await on.innerText(), "Turn on masking");
+        }
+        assert.deepEqual(await wide(page), { page: false, over: [] });
+        asked.length = 0;
+        await stillClick(page, on);
+        await until(() => asked.some((x) => x.startsWith("settings")));
+        const back = JSON.parse(asked.find((x) => x.startsWith("settings")).slice(9));
+        assert.equal(back.redact, true);
+        assert.equal(back.redactPersonal, true, "personal data comes back on as it was");
+        await page.waitForFunction((was) => document.querySelector("#maskCard .msk-head button.text")?.textContent === was, offText);
+        assert.deepEqual(errors, []);
+      });
+    }
   }
 
   test(`${engine}: a masked call on the Gateway page, and a key in the address, open its request`, async (t) => {
@@ -358,13 +474,130 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     assert.equal(await page.locator("#activity .call-item.open").count(), 0, "the click wasn't the row's");
     assert.match(await page.locator("#maskOne .msk-when").textContent(), /\d/);
     // the tray panel's badge opens the window on key=
-    await page.goto("http://magpie.test/?view=masking&key=1001");
+    await page.goto("http://magpie.test/?view=masking&key=" + K1);
     await page.locator("#maskOne .msk-gone").waitFor();
     assert.equal(new URL(page.url()).searchParams.get("key"), null, "read once");
     // and Settings › Privacy links to the page
     await page.goto("http://magpie.test/?view=settings&tab=privacy");
     await page.locator("#redactList .row", { hasText: "What was masked" }).locator("button").click();
     await page.locator("#maskCard .msk-num").waitFor();
+    assert.deepEqual(errors, []);
+  });
+}
+
+// "Keep a key's form" sends a made-up key of the real one's form in place of
+// a {{…}} placeholder (redact's shape.go): the page marks it, and puts the
+// real key against it, as it does a placeholder (#3599)
+const MADE = "sk_hYQWRBFmdHNIo5XVT2VnIIGh4mmMiJNm", REAL = "sk_w3axCByTQgK1PxqPhfKTrJOLBqz6sbZv";
+const made = {
+  records: [{ key: K5, t: ago(60e3), route: "chat", what: "chat", agent: "codex", provider: "openai", model: "gpt-5", n: 2, back: { [MADE]: 1 },
+    values: [{ p: MADE, k: "API_KEY", b: "rule", h: "sk_w", l: 35, n: 2, known: true }],
+    snips: { [MADE]: `OPENAI_API_KEY=${MADE}` } }],
+  sent: { [K5]: JSON.stringify({ model: "gpt-5", messages: [{ role: "user", content: `OPENAI_API_KEY=${MADE} sk_live_other\nonce more: ${MADE}` }] }) },
+  known: { [MADE]: REAL },
+};
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh"]) {
+    test(`${engine} ${lang}: a made-up key is marked as a placeholder is`, async (t) => {
+      const { browser, page, errors } = await open(engine, lang, 1100, summary, "", made);
+      t.after(() => browser.close());
+      await page.locator("#maskList .msk-row").first().click();
+      const one = page.locator("#maskOne");
+      await one.locator(".msk-msg").first().waitFor();
+      assert.deepEqual(await one.locator(".msk-msg .msk-text").last().locator("mark").allTextContents(), [MADE, MADE], "as the vendor got it");
+      assert.deepEqual(await one.locator(".msk-msg .msk-text").first().locator("mark").allTextContents(), [REAL, REAL], "as written here");
+      await stillClick(page, one.locator(".msk-val").first());
+      assert.equal(await one.locator("mark.lit").count(), 4);
+      await untranslated(page, lang);
+      assert.deepEqual(errors, []);
+    });
+  }
+}
+
+// After a restart a record has no text left at all: the request's text,
+// the lines around its values and the values are memory's alone, never on
+// disk (maskrec). The page says that once, and doesn't say the lines are
+// still there (brianeee2 on X, in Docker, took it for a missing volume).
+const restarted = {
+  records: [{ key: K1, t: ago(300e3), route: "chat", what: "chat", agent: "claude", provider: "anthropic", model: "claude-opus-4-1", n: 1,
+    values: [{ p: NAME, k: "PERSON", b: "model", h: "", l: 3, n: 1 }] }],
+  sent: {},
+};
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    test(`${engine} ${lang}: a request from before a restart says its text was in memory only, once`, async (t) => {
+      const { browser, page, errors, asked } = await open(engine, lang, 640, summary, "", restarted);
+      t.after(() => browser.close());
+      await page.locator("#maskList .msk-row").first().click();
+      const one = page.locator("#maskOne");
+      await until(() => asked.includes("sent " + K1));
+      await one.locator(".msk-gone").waitFor();
+      assert.equal(await one.locator(".msk-gone").count(), 1, "one message");
+      assert.equal(await one.locator(".msk-none").count(), 0, "no second message");
+      assert.equal(await one.locator(".msk-msg").count(), 0);
+      const said = await one.locator(".msk-gone").innerText();
+      if (lang === "en") {
+        assert.match(said, /never on disk/);
+        assert.doesNotMatch(said, /line around each placeholder/, "no line is left to show");
+      }
+      await untranslated(page, lang);
+      assert.deepEqual(await wide(page), { page: false, over: [] });
+      assert.deepEqual(errors, []);
+    });
+  }
+}
+
+// Clear records… deletes what masking kept, after a confirm (maxyou2090:
+// strict masking had kept many records): Cancel sends nothing, Clear posts
+// once and the page reads again to nothing; a failed clear says why and
+// lists what is still there
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    for (const width of [1100, 640]) {
+      test(`${engine} ${lang} ${width}px: Clear records asks first, then empties the page`, async (t) => {
+        const { browser, page, errors, asked } = await open(engine, lang, width, summary);
+        t.after(() => browser.close());
+        const list = page.locator("#maskList"), clear = list.locator(".msk-foot .msk-clear");
+        await list.locator(".msk-row").first().waitFor();
+        await clear.waitFor();
+        assert.deepEqual(await wide(page), { page: false, over: [] });
+        await shot(page, `clear-${engine}-${lang}-${width}`);
+        await stillClick(page, clear);
+        const dialog = page.locator("dialog.action-confirm");
+        await dialog.waitFor();
+        await shot(page, `confirm-${engine}-${lang}-${width}`);
+        if (lang !== "en") {
+          const said = await dialog.innerText();
+          for (const w of ["Clear masking records", "is deleted from this computer", "Cancel"]) assert(!said.includes(w), `${w} left in English: ${said}`);
+        }
+        await dialog.locator("button:not(.primary)").click();
+        await dialog.waitFor({ state: "detached" });
+        await page.waitForTimeout(100);
+        assert(!asked.some((a) => a.startsWith("clear")), "Cancel sends nothing");
+        assert(await list.locator(".msk-row").count() > 0, "Cancel keeps the list");
+        await clear.click();
+        await dialog.locator("button.primary").click();
+        await list.locator(".msk-none").waitFor();
+        assert.deepEqual(asked.filter((a) => a.startsWith("clear")), ["clear POST"]);
+        assert.equal(await list.locator(".msk-row").count(), 0);
+        await clear.waitFor({ state: "detached" });
+        await untranslated(page, lang);
+        assert.deepEqual(await wide(page), { page: false, over: [] });
+        assert.deepEqual(errors, []);
+      });
+    }
+  }
+  test(`${engine}: a clear that fails says why and keeps the list`, async (t) => {
+    const { browser, page, errors, asked } = await open(engine, "en", 1100, summary, "", { clearFails: true });
+    t.after(() => browser.close());
+    const list = page.locator("#maskList");
+    await list.locator(".msk-row").first().waitFor();
+    await list.locator(".msk-foot .msk-clear").click();
+    await page.locator("dialog.action-confirm button.primary").click();
+    await until(() => asked.includes("clear POST"));
+    await page.locator("#status", { hasText: "permission denied" }).waitFor();
+    await list.locator(".msk-row").first().waitFor();
+    assert.equal(await list.locator(".msk-row").count(), 3, "every record still listed");
     assert.deepEqual(errors, []);
   });
 }

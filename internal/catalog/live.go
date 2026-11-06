@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/filememo"
 )
 
@@ -26,7 +27,7 @@ import (
 
 // LivePath is where the fetched model list of one provider is kept.
 func LivePath(provider string) string {
-	return filepath.Join(filepath.Dir(CachePath()), "models", provider+".json")
+	return appdir.JoinFile(appdir.Join(filepath.Dir(CachePath()), "models"), provider, ".json")
 }
 
 type liveFile struct {
@@ -38,6 +39,9 @@ type liveFile struct {
 	// merged into Models. A base that can't be asked keeps its own part
 	// from the list saved before (#904).
 	Sides map[string][]Model `json:"sides,omitempty"`
+	// Kinded is set on a list saved since lists keep the models made for
+	// another API, tagged (Model.Serves): LiveKinded.
+	Kinded bool `json:"kinded,omitempty"`
 	// byID is the chat models by their id, in the list's order, made
 	// once a read: asked for every model of a list, a copy and a scan of
 	// the list each time cost 2,500 models' /v1/models seconds (K.Liu on
@@ -51,12 +55,34 @@ func readLive(provider string) (liveFile, error) {
 		if err := json.Unmarshal(b, &f); err != nil {
 			return f, err
 		}
+		mendKinds(f.Models)
+		for _, side := range f.Sides {
+			mendKinds(side)
+		}
 		f.byID = map[string][]Model{}
 		for _, m := range Chat(f.Models) {
 			f.byID[m.ID] = append(f.byID[m.ID], m)
 		}
 		return f, nil
 	})
+}
+
+// mendKinds reads a list saved before Kinds as Kinds reads it now: an
+// OpenCode Go list kept with media types ("image/jpeg") said its models
+// took no image until it was fetched again, so a model that sees is told
+// so from the first read after the update, not the next fetch.
+func mendKinds(ms []Model) {
+	for i := range ms {
+		m := &ms[i]
+		if m.InputModalities == nil {
+			continue
+		}
+		m.InputModalities, m.OutputModalities = Kinds(m.InputModalities), Kinds(m.OutputModalities)
+		if m.ImageInput != nil && !*m.ImageInput && slices.Contains(m.InputModalities, "image") {
+			yes := true
+			m.ImageInput, m.Images = &yes, true
+		}
+	}
 }
 
 // LiveByID are the models of Live with this id, in the list's order
@@ -68,6 +94,24 @@ func LiveByID(provider, model string) []Model {
 		return nil
 	}
 	return slices.Clone(f.byID[model])
+}
+
+// LiveByIDShared is LiveByID without the copy, for a caller that only
+// reads it: asked for a model's APIs, price or tiers for every model a
+// page lists, the copies were 32 MB of a live magpie's 2.6 GB in a minute
+// and a half.
+func LiveByIDShared(provider, model string) []Model {
+	f, err := readLive(provider)
+	if err != nil {
+		return nil
+	}
+	return slices.Clip(f.byID[model])
+}
+
+// LiveListed is whether Live lists any model, without the list copied.
+func LiveListed(provider string) bool {
+	f, err := readLive(provider)
+	return err == nil && len(f.byID) > 0
 }
 
 // Live returns the model list last fetched from the provider, if any: the
@@ -141,11 +185,37 @@ func LiveVideomakers(provider string) []Model {
 	return out
 }
 
-// Chat is ms without the models that draw or make videos.
+// LiveServing are the models in the provider's fetched list made for the
+// API serves names (Model.Serves), in the list's order; "" is every such
+// model, whatever its API.
+func LiveServing(provider, serves string) []Model {
+	f, err := readLive(provider)
+	if err != nil {
+		return nil
+	}
+	var out []Model
+	for _, m := range f.Models {
+		if m.Serves != "" && (serves == "" || m.Serves == serves) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// LiveKinded is whether the provider's fetched list was saved since lists
+// keep the models made for other APIs (Model.Serves): one saved before
+// left them out, and is fetched again once to have them (#5339).
+func LiveKinded(provider string) bool {
+	f, err := readLive(provider)
+	return err == nil && f.Kinded
+}
+
+// Chat is ms without the models that draw, make videos or are made for
+// another API (Model.Serves).
 func Chat(ms []Model) []Model {
 	out := make([]Model, 0, len(ms))
 	for _, m := range ms {
-		if !m.Draws && !m.Films {
+		if !m.Draws && !m.Films && m.Serves == "" {
 			out = append(out, m)
 		}
 	}
@@ -176,7 +246,7 @@ func SaveLiveSides(provider, base string, models []Model, sides map[string][]Mod
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(liveFile{Fetched: time.Now(), Base: base, Models: models, Sides: sides}, "", "  ")
+	b, _ := json.MarshalIndent(liveFile{Fetched: time.Now(), Base: base, Models: models, Sides: sides, Kinded: true}, "", "  ")
 	if err := os.WriteFile(p, b, 0o644); err != nil {
 		return err
 	}
@@ -555,8 +625,16 @@ func fetchPage(ctx context.Context, url, key string, anthropic bool, headers map
 		return nil, false, "", fmt.Errorf("%s: not a model list", url)
 	}
 	rows := v.Data
+	// each row as it was sent too, for one that is a Codex catalog entry
+	// (Model.Codex): rows decoded, so these decode alike
+	var raw struct {
+		Data   []json.RawMessage `json:"data"`
+		Models []json.RawMessage `json:"models"`
+	}
+	json.Unmarshal(b, &raw)
+	raws := raw.Data
 	if len(rows) == 0 {
-		rows = v.Models
+		rows, raws = v.Models, raw.Models
 	}
 	// A list that says it has more is a page of the vendor's catalog, not
 	// the catalog: a model the user picked that lives on a later page is
@@ -569,21 +647,57 @@ func fetchPage(ctx context.Context, url, key string, anthropic bool, headers map
 	// Anthropic's and OpenAI's /v1/models both page with has_more and
 	// last_id.
 	var out []Model
-	for _, r := range rows {
+	for i, r := range rows {
 		id := r.ID
 		if id == "" {
 			id = r.Name
 		}
+		var codex json.RawMessage
+		if i < len(raws) && CodexEntry(raws[i]) {
+			codex = raws[i]
+			if id == "" {
+				id = r.Slug // Codex's catalog names a model by its slug alone
+			}
+		}
 		if id == "" {
+			continue
+		}
+		// one that goes from here and comes back (magpie_via.go)
+		if loops(r.Via) {
 			continue
 		}
 		// Another magpie's list is already what its user exposed. Keep
 		// its retrieval models too; a vendor's general list still leaves
 		// out models agents can't chat with.
 		decision := r.Kind == "decision"
-		films := r.Kind == "video"
-		drawer := !films && !decision && (DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image")
-		if !drawer && !films && !decision && headers["X-Magpie-Drawers"] == "" && !textModel(mdModel{ID: id}) {
+		ins, outs := Kinds(r.Modalities.Input), Kinds(r.Modalities.Output)
+		if ins == nil && outs == nil {
+			// Volcengine Ark's names: {"input_modalities": […],
+			// "output_modalities": ["video"]}
+			ins, outs = Kinds(r.Modalities.InputModalities), Kinds(r.Modalities.OutputModalities)
+		}
+		// a model the list says makes videos: another magpie's kind, or,
+		// where the list marks no kind, Ark's domain "VideoGeneration" or
+		// an output of video without text (doubao-seedance-*, wan2-1-*),
+		// which is no model to chat with (axelburks on Discord: Ark's
+		// Seedance sat among its chat models, not under Video models);
+		// OpenAI's sora ids, whose bare list marks no kind and says no
+		// modalities at all (#4954)
+		films := r.Kind == "video" || r.Kind == "" && (r.Domain == "VideoGeneration" || slices.Contains(outs, "video") && !slices.Contains(outs, "text")) || FilmsID(id)
+		drawer := !films && !decision && (DrawsID(id) && !strings.Contains(strings.ToLower(id), "deep-research") || r.Kind == "image" ||
+			r.Kind == "" && (r.Domain == "ImageGeneration" || slices.Contains(outs, "image") && !slices.Contains(outs, "text")))
+		// and none the list says answers without text (Ark's 3D models)
+		md := mdModel{ID: id}
+		md.Modalities.Output = outs
+		// one made for another API (embeddings, rerank, speech,
+		// transcriptions) is kept, said so, for that API's routes and
+		// groups (#5339); another magpie's list keeps them as it lists
+		// them
+		serves := ""
+		if !drawer && !films && !decision && headers["X-Magpie-Drawers"] == "" {
+			serves = ServesOf(id)
+		}
+		if !drawer && !films && !decision && serves == "" && headers["X-Magpie-Drawers"] == "" && !textModel(md) {
 			continue
 		}
 		name, plain := r.DisplayName, ""
@@ -601,7 +715,7 @@ func fetchPage(ctx context.Context, url, key string, anthropic bool, headers map
 		if name == "" {
 			name = id
 		}
-		input := imageInput(r.Modalities.Input)
+		input := imageInput(ins)
 		apis := EndpointAPIs(r.Endpoints)
 		if native := EndpointAPIs(r.Native); len(native) > 0 {
 			apis = native
@@ -609,8 +723,8 @@ func fetchPage(ctx context.Context, url, key string, anthropic bool, headers map
 		if len(apis) == 0 {
 			apis = targetAPIs(r.TypeTarget)
 		}
-		m := Model{ID: id, Name: name, Plain: plain, ImageInput: input, APIs: apis, Draws: drawer, Films: films, Decides: decision,
-			InputModalities: r.Modalities.Input, OutputModalities: r.Modalities.Output}
+		m := Model{ID: id, Name: name, Plain: plain, ImageInput: input, APIs: apis, Draws: drawer, Films: films, Decides: decision, Serves: serves,
+			InputModalities: ins, OutputModalities: outs}
 		if n, ok := r.ContextLength.(float64); ok && n > 0 {
 			m.Context = int(n)
 		}
@@ -629,6 +743,11 @@ func fetchPage(ctx context.Context, url, key string, anthropic bool, headers map
 		if len(r.Price) > 0 && json.Unmarshal(r.Price, &pr) == nil && pr != nil && pr.sane() {
 			m.Price = pr
 		}
+		if codex != nil {
+			codexFacts(&m, r, codex)
+		}
+		kimiFacts(&m, r)
+		m.Via = slices.Clip(r.Via)
 		out = append(out, m)
 	}
 	return out, v.HasMore, v.LastID, nil
@@ -668,7 +787,13 @@ type liveModel struct {
 	Modalities  struct {
 		Input  []string `json:"input"`
 		Output []string `json:"output"`
+		// Volcengine Ark's
+		InputModalities  []string `json:"input_modalities"`
+		OutputModalities []string `json:"output_modalities"`
 	} `json:"modalities"`
+	// what Volcengine Ark's list says a model is for: "LLM",
+	// "VideoGeneration", "ImageGeneration"…
+	Domain string `json:"domain"`
 	// the paths the model is served on, where the vendor says: Command
 	// Code's Claude models on /messages alone, its open ones on
 	// /chat/completions and /responses
@@ -700,9 +825,86 @@ type liveModel struct {
 	// its X-Magpie-Prices header: the price its user set, else its list
 	// price. Raw, as an odd value mustn't lose the whole list
 	Price json.RawMessage `json:"magpie_price"`
+	// the magpies another magpie's model passes through to its vendor,
+	// itself last (magpie_via.go)
+	Via []string `json:"magpie_via"`
 	// the protocol family PipeLLM routes the model by: openai, anthropic
 	// or gemini
 	TypeTarget string `json:"type_target"`
+	// a Codex catalog entry's (CodexEntry): its id, its window and the
+	// most it may be raised to, and what it takes. any, as an odd value
+	// mustn't lose the whole list
+	Slug      string `json:"slug"`
+	Window    any    `json:"context_window"`
+	MaxWindow any    `json:"max_context_window"`
+	Inputs    any    `json:"input_modalities"`
+	// what Kimi Code's list (/coding/v1/models) says of a model's
+	// thinking and tools, flat and nested: supports_thinking_type
+	// "only" is a model that always thinks, supports_dynamic_tools one
+	// that loads tools mid-conversation, think_efforts' default_effort
+	// the effort it thinks at unasked (Model.AlwaysThinks, DynamicTools,
+	// DefaultEffort). any, as an odd value mustn't lose the whole list
+	ThinkingType any `json:"supports_thinking_type"`
+	DynTools     any `json:"supports_dynamic_tools"`
+	ThinkEfforts any `json:"think_efforts"`
+	Reasoning    any `json:"reasoning"`
+	Tools        any `json:"tools"`
+}
+
+// kimiFacts reads what Kimi Code's model list says of a model's thinking
+// and tools into m, from its flat fields or their nested forms
+// (reasoning.type, reasoning.effort.default, tools.dynamic_load).
+func kimiFacts(m *Model, r liveModel) {
+	field := func(v any, keys ...string) any {
+		for _, k := range keys {
+			o, ok := v.(map[string]any)
+			if !ok {
+				return nil
+			}
+			v = o[k]
+		}
+		return v
+	}
+	if t, _ := r.ThinkingType.(string); t == "only" {
+		m.AlwaysThinks = true
+	} else if t, _ := field(r.Reasoning, "type").(string); t == "only" && r.ThinkingType == nil {
+		m.AlwaysThinks = true
+	}
+	if b, ok := r.DynTools.(bool); ok {
+		m.DynamicTools = b
+	} else if b, ok := field(r.Tools, "dynamic_load").(bool); ok {
+		m.DynamicTools = b
+	}
+	if d, _ := field(r.ThinkEfforts, "default_effort").(string); d != "" {
+		m.DefaultEffort = d
+	} else if d, _ := field(r.Reasoning, "effort", "default").(string); d != "" {
+		m.DefaultEffort = d
+	}
+}
+
+// codexFacts reads what a Codex catalog entry says of its model into m:
+// the window, the most it may be raised to and whether it takes images,
+// where the row says nothing else of them. The entry itself is kept
+// whole in m.Codex.
+func codexFacts(m *Model, r liveModel, raw json.RawMessage) {
+	m.Codex = raw
+	if n, ok := r.Window.(float64); ok && n > 0 && m.Context == 0 {
+		m.Context = int(n)
+	}
+	if n, ok := r.MaxWindow.(float64); ok && int(n) > m.Context {
+		m.MaxContext = int(n)
+	}
+	if xs, ok := r.Inputs.([]any); ok && m.InputModalities == nil {
+		in := []string{}
+		for _, x := range xs {
+			if s, ok := x.(string); ok {
+				in = append(in, s)
+			}
+		}
+		in = Kinds(in)
+		m.InputModalities, m.ImageInput = in, imageInput(in)
+		m.Images = *m.ImageInput
+	}
 }
 
 // tiersOf are the ids of a list's service_tiers, as Codex's catalog
@@ -782,6 +984,7 @@ func targetAPIs(target string) []string {
 // catalog's entry for the same id, keeping the live order.
 func Decorate(live []Model, known []Model) []Model {
 	byID := make(map[string]Model, len(known))
+	var bySame map[string]Model
 	for _, m := range known {
 		byID[m.ID] = m
 	}
@@ -791,6 +994,20 @@ func Decorate(live []Model, known []Model) []Model {
 		k, ok := byID[m.ID]
 		if i := strings.LastIndexByte(m.ID, '/'); !ok && i >= 0 {
 			k, ok = byID[m.ID[i+1:]] // a gateway's "deepseek/deepseek-chat"
+		}
+		if !ok && len(known) > 0 {
+			// the same model under another spelling (SameModel): Ark's
+			// list says glm-5-3-flash-260828 where its plan's catalog
+			// says glm-5.3-flash. Of several, the first known.
+			if bySame == nil {
+				bySame = make(map[string]Model, len(known))
+				for _, x := range known {
+					if _, dup := bySame[SameModel(x.ID)]; !dup {
+						bySame[SameModel(x.ID)] = x
+					}
+				}
+			}
+			k, ok = bySame[SameModel(m.ID)]
 		}
 		if ok {
 			if m.Name == "" || m.Name == m.ID {

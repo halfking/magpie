@@ -208,6 +208,16 @@ func TestGatewayKeyLimitCLI(t *testing.T) {
 			t.Error("accepted", args)
 		}
 	}
+	// month ends in an h, and is the month, not a count of hours
+	if got, err = call("limit", id, "month", "--cost", "20"); err != nil || !strings.Contains(got, "this month") {
+		t.Fatal(got, err)
+	}
+	if keys, _ = access.List(); keys[0].Limit == nil || keys[0].Limit.Period != "month" || keys[0].Limit.Cost != 20 {
+		t.Fatalf("limit kept as %+v", keys[0].Limit)
+	}
+	if got, err = call("limit", id, "add", "week", "--tokens", "1m"); err != nil || !strings.Contains(got, "Limit 2") {
+		t.Fatal(got, err)
+	}
 	if got, err := call("limit", id, "off"); err != nil || !strings.Contains(got, "no limit") {
 		t.Fatal(got, err)
 	}
@@ -435,5 +445,106 @@ func TestGatewayKeyQuotasCLI(t *testing.T) {
 	}
 	if keys, _ = access.List(); keys[0].Quotas {
 		t.Fatal("not kept off")
+	}
+}
+
+// magpie gateway-key move puts a key at a place, counted from 1 as list
+// shows them, and list shows the keys in that order (alextjy on Discord).
+func TestGatewayKeyCLIMove(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	call := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		err := gatewayKeysTo(&out, append([]string{"gateway-key"}, args...))
+		return out.String(), err
+	}
+	for _, name := range []string{"Laptop", "Phone", "CI"} {
+		if _, err := call("add", name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys, _ := access.List()
+	if _, err := call("move", keys[2].ID, "1"); err != nil {
+		t.Fatal(err)
+	}
+	list, err := call("list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci, laptop, phone := strings.Index(list, "CI"), strings.Index(list, "Laptop"), strings.Index(list, "Phone")
+	if ci < 0 || !(ci < laptop && laptop < phone) {
+		t.Fatal("list after moving CI to 1:\n" + list)
+	}
+	for _, bad := range []string{"0", "4", "top"} {
+		if _, err := call("move", keys[0].ID, bad); err == nil {
+			t.Fatal("place", bad)
+		}
+	}
+	if _, err := call("move", "nope", "1"); err == nil {
+		t.Fatal("no such key")
+	}
+	if _, err := call("move", keys[0].ID); err == nil {
+		t.Fatal("no place")
+	}
+}
+
+// --model makes a limit count only some models (zola_xynb on X), beside
+// one of the whole key in the same window; the plain form changes the one
+// of those models, and the list says which models each counts.
+func TestGatewayKeyScopedLimitCLI(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	call := func(args ...string) (string, error) {
+		var out bytes.Buffer
+		err := gatewayKeysTo(&out, append([]string{"gateway-key"}, args...))
+		return out.String(), err
+	}
+	if _, err := call("add", "Team"); err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := access.List()
+	id := keys[0].ID
+	limits := func() []*access.Limit {
+		keys, _ := access.List()
+		return keys[0].Limits()
+	}
+	if _, err := call("limit", id, "month", "--cost", "100"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := call("limit", id, "add", "month", "--cost", "20", "--model", "openai/*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "openai/*") {
+		t.Fatalf("the list says %q", got)
+	}
+	if _, err := call("limit", id, "add", "month", "--cost", "5", "--models", "anthropic/claude-opus,zai/*", "--model", "kimi/k2"); err != nil {
+		t.Fatal(err)
+	}
+	ls := limits()
+	if len(ls) != 3 || ls[0].Scoped() || strings.Join(ls[1].Models, " ") != "openai/*" || strings.Join(ls[2].Models, " ") != "anthropic/claude-opus zai/* kimi/k2" {
+		t.Fatalf("kept as %+v %+v %+v", ls[0], ls[1], ls[2])
+	}
+	// the plain form changes the month of OpenAI, not the key's
+	if _, err := call("limit", id, "month", "--cost", "30", "--model", "openai/*"); err != nil {
+		t.Fatal(err)
+	}
+	if ls := limits(); ls[0].Cost != 100 || ls[1].Cost != 30 {
+		t.Fatalf("after changing OpenAI's month: %+v %+v", ls[0], ls[1])
+	}
+	for _, args := range [][]string{
+		{"limit", id, "add", "month", "--cost", "5", "--model", "openai/*"}, // the same window and models again
+		{"limit", id, "add", "day", "--cost", "5", "--model", "group/coding"},
+		{"limit", id, "add", "day", "--cost", "5", "--model"},
+		{"limit", id, "add", "day", "--cost", "5", "--model", "gpt-5"},
+	} {
+		if _, err := call(args...); err == nil {
+			t.Fatal("accepted", args)
+		}
+	}
+	if ls := limits(); len(ls) != 3 {
+		t.Fatalf("a refused command left %d limits", len(ls))
 	}
 }

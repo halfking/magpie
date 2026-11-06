@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/autostart"
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/proc"
@@ -103,7 +104,22 @@ func Install(o Options) error {
 		return err
 	}
 	widenPath()
-	return m.install(exe, serveArgs(o), withKey(environ(), o))
+	if err := m.install(exe, serveArgs(o), withKey(environ(), o)); err != nil {
+		return err
+	}
+	os.Remove(removedMark())
+	return nil
+}
+
+// removedMark is there once the user removed the service (Uninstall): what
+// magpie puts in place by itself (the terminal's keepGateway, as it quits) is put there
+// no more.
+func removedMark() string { return filepath.Join(appdir.Config(), "daemon-removed") }
+
+// Removed says the user removed the service, and hasn't installed it since.
+func Removed() bool {
+	_, err := os.Stat(removedMark())
+	return err == nil
 }
 
 // serveArgs is what the service runs magpie with.
@@ -231,7 +247,14 @@ func Node() string {
 
 // Uninstall stops the service and removes it. One not installed is left
 // as it is.
-func Uninstall() error { return with(manager.uninstall) }
+func Uninstall() error {
+	err := with(manager.uninstall)
+	if err == nil {
+		os.MkdirAll(filepath.Dir(removedMark()), 0o700)
+		os.WriteFile(removedMark(), nil, 0o600)
+	}
+	return err
+}
 
 // Start starts the installed service.
 func Start() error { return installed(manager.start) }
@@ -278,10 +301,14 @@ func installed(f func(manager) error) error {
 	})
 }
 
-// autostartEnabled: magpie's own record is there, whether or not the
-// user has it switched off in System Settings for now, since switching
-// it back on there opens the app with the service still installed. A
-// var for the tests.
+// autostartEnabled: magpie opens at login, by its own record or, on
+// Linux, by a package's entry (#3372). On the Mac a record the user has
+// switched off in System Settings for now counts all the same, since
+// switching it back on there opens the app with the service still
+// installed. On Linux an entry the desktop's own settings switched off
+// (Hidden, X-GNOME-Autostart-enabled=false) reads off, as Open at login
+// reads it, so the install goes in; and a package's entry counts on a box
+// no desktop logs into too (#3756). A var for the tests.
 var autostartEnabled = func() bool { return autostart.Enabled() != autostart.Off }
 
 // self is the program the service runs: this one, by the name on PATH

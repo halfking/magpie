@@ -2,6 +2,7 @@ package usage
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"embed"
 	"encoding/binary"
@@ -16,6 +17,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/sessions"
@@ -47,7 +49,7 @@ func requestDiskPath() string {
 // source, which 17 of 99 releases changed.
 var requestDiskBinary = sync.OnceValue(func() string {
 	h := sha256.New()
-	io.WriteString(h, sessions.CallCacheVersion)
+	io.WriteString(h, sessions.CallCacheVersion())
 	// unread, it is the binary's, as it was
 	binary := func() string {
 		exe, err := os.Executable()
@@ -97,10 +99,14 @@ func appendDiskString(b []byte, s string) []byte {
 	return append(b, s...)
 }
 
-// diskEntry is c as an entry, or nil when it can't be kept: a chunk of
-// another computer's day, or one whose times are in a zone that can't be
-// named again.
-func diskEntry(c *rowChunk) []byte {
+// diskEntry is c as an entry, appended to b[:0], or nil when it can't be
+// kept: a chunk of another computer's day, or one whose times are in a
+// zone that can't be named again. A write hands each entry the last one's
+// b: grown from nil an entry at a time, a first write of 15.7k sessions
+// allocated ~300 MB in the seconds after a cold start's first page, and
+// the heap grew to 764 MB before a collection, the footprint's peak
+// (#2278).
+func diskEntry(b []byte, c *rowChunk) []byte {
 	if c.Computer != "" {
 		return nil
 	}
@@ -108,7 +114,7 @@ func diskEntry(c *rowChunk) []byte {
 	if len(archive) == 0 {
 		archive, locations = c.encode(func([]byte) bool { return true })
 	}
-	var b []byte
+	b = b[:0]
 	put := func(v uint64) { b = binary.AppendUvarint(b, v) }
 	s := c.Source
 	for _, t := range []string{s.Path, s.Key, s.Agent} {
@@ -117,7 +123,15 @@ func diskEntry(c *rowChunk) []byte {
 	put(uint64(s.Size))
 	put(uint64(s.Modified.UnixNano()))
 	put(uint64(c.Count))
-	put(uint64(c.Latest.UnixNano()))
+	// a chunk without calls has no Latest: the zero time's UnixNano is
+	// another time, read back as a call long ago, and such a chunk was
+	// settled after a read where it wasn't after a build (heatSplit), so a
+	// new version paired its whole history on two starts, not one (#2278)
+	latest := int64(0)
+	if !c.Latest.IsZero() {
+		latest = c.Latest.UnixNano()
+	}
+	put(uint64(latest))
 	put(uint64(len(locations)))
 	for _, loc := range locations {
 		name, offset := time.Unix(0, 0).In(loc).Zone()
@@ -130,9 +144,9 @@ func diskEntry(c *rowChunk) []byte {
 		b = appendDiskString(b, name)
 		put(uint64(int64(offset)))
 	}
-	put(uint64(len(c.codexActors)))
-	for _, actor := range c.codexActors {
-		b = appendDiskString(b, actor)
+	put(uint64(c.codexActors.len()))
+	for i := range c.codexActors.len() {
+		b = appendDiskString(b, c.codexActors.at(i))
 	}
 	put(uint64(len(archive)))
 	if !readMapped(c.mapped, func() { b = append(b, archive...) }) {
@@ -174,7 +188,9 @@ func readDiskEntry(b []byte) (*rowChunk, error) {
 	c.Source.Size = int64(take())
 	c.Source.Modified = time.Unix(0, int64(take()))
 	c.Count = int(take())
-	c.Latest = time.Unix(0, int64(take())).In(time.Local)
+	if latest := int64(take()); latest != 0 {
+		c.Latest = time.Unix(0, latest).In(time.Local)
+	}
 	n := take()
 	if b == nil || n > uint64(len(b)) {
 		return nil, errDiskEntry
@@ -211,14 +227,14 @@ func readDiskEntry(b []byte) (*rowChunk, error) {
 		if !good {
 			return nil, errDiskEntry
 		}
-		c.codexActors = append(c.codexActors, actor)
+		c.codexActors.add(actor)
 	}
 	n = take()
 	if b == nil || n != uint64(len(b)) || n == 0 {
 		return nil, errDiskEntry
 	}
 	c.Archive = b
-	c.Bytes = int64(len(b)+len(c.Locations)*8) + codexActorBytes(c.codexActors)
+	c.Bytes = int64(len(b)+len(c.Locations)*8) + c.codexActors.bytes()
 	return c, nil
 }
 
@@ -229,10 +245,12 @@ func readDiskEntry(b []byte) (*rowChunk, error) {
 // (#3493). It is unmapped once no chunk read from it is left.
 type diskMapping struct {
 	data []byte
+	// spill: a build's own file (archiveSpill), not requests-v1.bin
+	spill bool
 }
 
 // diskUnmapped, in tests, is told each time a mapping is let go of.
-var diskUnmapped func()
+var diskUnmapped atomic.Pointer[func()]
 
 // readMapped runs fn, which reads m's pages (none, with m nil). A fault
 // reading them, the file cut short under the mapping by another program,
@@ -352,8 +370,8 @@ func (idx *requestIndex) fromDisk(want map[string]sessions.CallSource) {
 			return true
 		}
 		c.Source = s
-		c.serial = nextChunkSerial()
-		c.Used = idx.tick
+		c.serial = sourceSerial(idx.root, idx.meta, s)
+		c.used = useAt(idx.tick)
 		idx.chunks[s.Path] = c
 		return true
 	})
@@ -373,12 +391,14 @@ func toDisk(root, meta string, chunks map[string]*rowChunk, on map[string]bool) 
 	defer os.Remove(out.Name())
 	w := bufio.NewWriterSize(out, 1<<20)
 	err = writeDiskEntry(w, diskHeader(binary, root, meta))
+	var buf []byte
 	for _, c := range chunks {
 		if err != nil {
 			break
 		}
-		if b := diskEntry(c); b != nil {
+		if b := diskEntry(buf, c); b != nil {
 			err = writeDiskEntry(w, b)
+			buf = b
 		}
 	}
 	if err == nil {
@@ -387,7 +407,7 @@ func toDisk(root, meta string, chunks map[string]*rowChunk, on map[string]bool) 
 			if !ok {
 				return false
 			}
-			if on[p] && chunks[p] == nil {
+			if on[string(p)] && chunks[string(p)] == nil {
 				err = writeDiskEntry(w, raw)
 			}
 			return err == nil
@@ -405,11 +425,101 @@ func toDisk(root, meta string, chunks map[string]*rowChunk, on map[string]bool) 
 	return os.Rename(out.Name(), path)
 }
 
-// diskEntryPath is the path of the source an entry is of.
-func diskEntryPath(b []byte) (string, bool) {
+// onDisk is a copy of each chunk of chunks whose Archive is of the heap
+// or a build's spill, with the same Archive of the pages of the file toDisk just wrote; save
+// swaps them in for the chunks of the same serial. Made
+// in this run, they held a cold build's archives on the heap until the
+// next start: 32MB of 15.7k sessions, and a resting heap 40MB over a warm
+// start's (#3493). Nothing on a system that maps no file.
+func onDisk(root, meta string, chunks map[string]*rowChunk) map[string]*rowChunk {
+	kept := map[string]*rowChunk{}
+	readDiskEntries(requestDiskPath(), requestDiskBinary(), root, meta, func(raw []byte, m *diskMapping) bool {
+		if m == nil {
+			return false
+		}
+		path, ok := diskEntryPath(raw)
+		if !ok {
+			return false
+		}
+		c := chunks[string(path)]
+		if c == nil || c.serial == 0 || c.pagesRank() == 2 || len(c.Archive) == 0 {
+			return true
+		}
+		size, modified, archive, ok := diskEntryArchive(raw)
+		if !ok || size != c.Source.Size || modified != c.Source.Modified.UnixNano() || !bytes.Equal(archive, c.Archive) {
+			return true
+		}
+		next := *c
+		next.Archive, next.mapped = archive, m
+		kept[string(path)] = &next
+		return true
+	})
+	return kept
+}
+
+// diskEntryPath is the path of the source an entry is of, of b's bytes.
+func diskEntryPath(b []byte) ([]byte, bool) {
 	n, k := binary.Uvarint(b)
 	if k <= 0 || n > uint64(len(b)-k) {
-		return "", false
+		return nil, false
 	}
-	return string(b[k : k+int(n)]), true
+	return b[k : k+int(n)], true
+}
+
+// diskEntryArchive is the size and mtime of the source an entry is of, and
+// its archive, of b's bytes: what onDisk compares, with nothing else of
+// the entry copied out (readDiskEntry's strings were ~95 MB of a first
+// write's ~440 MB, #2278).
+func diskEntryArchive(b []byte) (size, modified int64, archive []byte, ok bool) {
+	take := func() uint64 {
+		n, k := binary.Uvarint(b)
+		if k <= 0 {
+			b = nil
+			return 0
+		}
+		b = b[k:]
+		return n
+	}
+	skip := func() bool {
+		n := take()
+		if b == nil || n > uint64(len(b)) {
+			return false
+		}
+		b = b[n:]
+		return true
+	}
+	for range 3 { // path, key, agent
+		if !skip() {
+			return 0, 0, nil, false
+		}
+	}
+	size, modified = int64(take()), int64(take())
+	take() // count
+	take() // latest
+	n := take()
+	if b == nil || n > uint64(len(b)) {
+		return 0, 0, nil, false
+	}
+	for range n { // a zone's name and offset
+		if !skip() {
+			return 0, 0, nil, false
+		}
+		if take(); b == nil {
+			return 0, 0, nil, false
+		}
+	}
+	n = take()
+	if b == nil || n > uint64(len(b)) {
+		return 0, 0, nil, false
+	}
+	for range n { // actors
+		if !skip() {
+			return 0, 0, nil, false
+		}
+	}
+	n = take()
+	if b == nil || n != uint64(len(b)) || n == 0 {
+		return 0, 0, nil, false
+	}
+	return size, modified, b, true
 }

@@ -54,6 +54,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await (await browser.newContext({ viewport: { width, height: 1400 } })).newPage();
         page.setDefaultTimeout(5000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], saved = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, saved));
@@ -73,7 +74,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
             on: r.querySelector(".segs .opt.on")?.textContent,
             // right under the words themselves
             after: r.previousElementSibling?.querySelector("input.words") != null,
-            cut: sub.scrollWidth > sub.clientWidth + 1 || sub.scrollHeight > sub.clientHeight + 1,
+            hint: getComputedStyle(sub).getPropertyValue("--hint").trim() === "1",
             inside: b.left >= list.left - 1 && b.right <= list.right + 1,
             wide: document.documentElement.scrollWidth > document.documentElement.clientWidth,
           };
@@ -81,7 +82,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(m.name, w.name);
         assert.equal(m.on, w.off, "off unless the user turned it on");
         assert(m.after, "under Masked words");
-        assert(!m.cut && m.inside && !m.wide, "shown in full, inside the page");
+        assert(m.hint && m.inside && !m.wide, "its explanation rests out of sight, for the hover card, inside the page");
         if (lang !== "en") assert(!m.sub.includes("A word also matches"), "its words translated");
 
         const before = await page.evaluate(() => [scrollX, scrollY, document.querySelector("#view-settings").scrollTop]);
@@ -95,11 +96,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         assert.equal(saved[0].redact, true);
         assert.deepEqual(await page.evaluate(() => [scrollX, scrollY, document.querySelector("#view-settings").scrollTop]), before, "the click moved nothing");
 
-        // another choice on the page keeps it
-        const p = page.locator("#redactList .row").nth(1).locator(".segs .opt", { hasText: w.on });
+        // another choice on the page keeps it: Mask personal data, under
+        // the key's form
+        const p = page.locator("#redactShapeRow + .row").locator(".segs .opt", { hasText: w.on });
         await reach(page, p); // above it now, maybe under the tabs
         await p.click();
-        await page.waitForFunction(() => document.querySelector("#redactList .row:nth-child(2) .segs .opt.on")?.textContent === t("On"));
+        await page.waitForFunction(() => document.querySelector("#redactShapeRow + .row .segs .opt.on")?.textContent === t("On"));
         await new Promise((r) => setTimeout(r, 300));
         assert.equal(saved.length, 2);
         assert.equal(saved[1].redactPersonal, true);

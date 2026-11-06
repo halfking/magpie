@@ -21,6 +21,7 @@ import (
 	"github.com/klauspost/compress/gzhttp"
 
 	"github.com/yetone/magpie/internal/gateway"
+	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/update"
 )
 
@@ -141,6 +142,10 @@ func (w *Web) Wait() error {
 	if err != nil {
 		return err
 	}
+	// the plugin hosts end, waited for, first: one still running at the
+	// exec is a child nothing waits for after it, <defunct> under this
+	// pid from then on (#3285)
+	plugin.EndHosts()
 	return update.Reexec(exe, os.Args[1:], append(os.Environ(), webRunKey+"="+w.key))
 }
 
@@ -227,6 +232,14 @@ func webGuard(cookie, key string, keep time.Duration, next http.Handler) http.Ha
 			signIn(rw, r, u.RequestURI())
 			return
 		}
+		// what a phone's home screen reads to add the page as an app
+		// (index.html's manifest and icons; ninja_s6114 on Discord):
+		// fixed bytes of the build, which a browser may ask for without
+		// the page's cookie. These paths alone, read alone.
+		if webAppFiles[r.URL.Path] && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			next.ServeHTTP(rw, r)
+			return
+		}
 		if r.URL.Path == webSignInPath && r.Method == http.MethodPost {
 			r.Body = http.MaxBytesReader(rw, r.Body, 4096)
 			back := localPath(r.PostFormValue("back"))
@@ -258,6 +271,17 @@ func webGuard(cookie, key string, keep time.Duration, next http.Handler) http.Ha
 		log.Printf("magpie web: turned away %s from %s: %s", r.URL.Path, r.RemoteAddr, short)
 		webTurnedAway(rw, r, r.URL.RequestURI(), why)
 	})
+}
+
+// webAppFiles are the files webGuard serves without the key: the web app
+// manifest and the icons it and index.html name, so "Add to Home Screen"
+// gets them whether or not the browser sends its cookie with them. Each is
+// a file of the build, the same for every magpie; nothing in it is the
+// user's.
+var webAppFiles = map[string]bool{
+	"/manifest.json":              true,
+	"/icons/apple-touch-icon.png": true,
+	"/icons/icon-512.png":         true,
 }
 
 // webSignInPath takes the key pasted into the form a page turned away shows.
@@ -305,21 +329,14 @@ func NetworkLinks(port, key string) []string {
 
 // LANAddrs are this computer's addresses on the local network, for the
 // links to print when the page is served there: MAGPIE_PUBLIC_URL's host
-// when set (in a container, whose own addresses the network can't reach).
+// when set (in a container, whose own addresses the network can't reach),
+// else the gateway's own (gateway.LANHosts), so Settings lists one
+// computer's addresses the same way twice.
 func LANAddrs() []string {
 	if h := gateway.PublicHost(); h != "" {
 		return []string{h}
 	}
-	var out []string
-	as, _ := net.InterfaceAddrs()
-	for _, a := range as {
-		n, ok := a.(*net.IPNet)
-		if !ok || n.IP.IsLoopback() || n.IP.To4() == nil || !n.IP.IsPrivate() {
-			continue
-		}
-		out = append(out, n.IP.String())
-	}
-	return out
+	return gateway.LANHosts()
 }
 
 // webServed is all `magpie web` on port serves: the gateway's client
@@ -332,7 +349,55 @@ func webServed(port, key string, keep time.Duration, page http.Handler) http.Han
 // webHandler is what `magpie web` on port serves: the page and its API
 // behind the key, compressed for the browser.
 func webHandler(port, key string, keep time.Duration, page http.Handler) http.Handler {
-	return webCompressed(webGuard("magpie_web_"+port, key, keep, page))
+	return webCompressed(webGuard("magpie_web_"+port, key, keep, webOwnPage(page)))
+}
+
+// webOwnPage turns away a request for /api that another page sent with
+// the page's cookie. The cookie is SameSite=Lax, so a browser sends it
+// with any request one site sends another, and a site is the registrable
+// domain without the port: a page on another port of 127.0.0.1 or of the
+// LAN address, or on a sibling name behind the same reverse proxy, could
+// POST a stdio MCP server to /api/library/servers/save as text/plain in
+// no-cors mode and start it with /api/library/mcp/check, which is code run
+// as the user. Only the page itself may write: a write (any method but
+// GET, HEAD and OPTIONS) is judged by net/http's CrossOriginProtection,
+// which takes the browser's Sec-Fetch-Site (same-origin, or none for what
+// the user did) and, from a browser too old to send it, an Origin that is
+// absent or names the request's own Host or MAGPIE_PUBLIC_URL. A read is
+// turned away too when the browser says another origin sent it, so that
+// no GET route that does something (an import read once, a sign-in
+// started) is any page's to call, whether or not it answers.
+//
+// The desktop window's /api is served in the process, over no port, and
+// has no cookie for another page to borrow, so this is for the browser's
+// page alone.
+func webOwnPage(next http.Handler) http.Handler {
+	cop := http.NewCrossOriginProtection()
+	if u, err := url.Parse(gateway.PublicURL()); err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https") {
+		// behind a proxy that passes on a Host of its own, the page's
+		// address is the one the user named
+		if err := cop.AddTrustedOrigin(u.Scheme + "://" + u.Host); err != nil {
+			log.Printf("magpie web: MAGPIE_PUBLIC_URL %s is no origin: %v", u, err)
+		}
+	}
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(rw, r)
+			return
+		}
+		err := cop.Check(r)
+		if err == nil {
+			if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+				err = errors.New("Sec-Fetch-Site " + site)
+			}
+		}
+		if err != nil {
+			log.Printf("magpie web: turned away %s %s from another page (Origin %q): %v", r.Method, r.URL.Path, r.Header.Get("Origin"), err)
+			http.Error(rw, "magpie's API answers magpie's own page only", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(rw, r)
+	})
 }
 
 // webCompressed gzips what `magpie web` sends a browser that takes it: the
@@ -371,33 +436,53 @@ func webCompressed(next http.Handler) http.Handler {
 // gzipETag ends the ETag of a gzipped response.
 const gzipETag = "-gzip"
 
-// compressible: text, scripts, JSON and SVG; not PNG, WebP, ICO or JPEG.
+// compressible: text, scripts, JSON and SVG; not PNG, WebP, ICO or JPEG,
+// and not an event stream, which gzip holds back until a block fills (a
+// plugin page's service streams a chat's tokens, servePageService).
 func compressible(ct string) bool {
 	ct = strings.ToLower(strings.TrimSpace(ct))
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = strings.TrimSpace(ct[:i])
 	}
+	if ct == "text/event-stream" {
+		return false
+	}
 	return strings.HasPrefix(ct, "text/") || strings.HasSuffix(ct, "javascript") ||
 		strings.HasSuffix(ct, "json") || ct == "image/svg+xml"
 }
 
-// isWeb: the page is served to a browser by `magpie web`.
-func isWeb(w Windows) bool { _, ok := w.(webHost); return ok }
+// browserTab is a Windows that stands for a browser tab: magpie web's
+// (webHost) or one on the page the app serves (appWebHost).
+type browserTab interface{ browserTab() }
+
+func (webHost) browserTab() {}
+
+// isWeb: the page is served to a browser, by `magpie web` or by the app.
+func isWeb(w Windows) bool { _, ok := w.(browserTab); return ok }
+
+// ownWeb: the page is `magpie web`'s own (its gateway mode, its restart
+// to update), not the app's served to a browser.
+func ownWeb(w Windows) bool { _, ok := w.(webHost); return ok }
 
 // onePort hands the gateway's client routes (gateway.ClientPath: /v1/…,
 // /v1beta/…, /mcp/…) on the page's port to the gateway, so the page and the
 // agents share one address and a reverse proxy needs one location for both
 // (zgcwkj on Discord). Each such request is judged by the gateway's own
-// guards (Server.Front), not the page's key: an agent has no cookie, and a
-// request from another machine or through a proxy needs a gateway key
-// while magpie is shared, as on the gateway's port. Everything else (the
-// page, its /api/*) stays behind the page's allow list and key.
+// guards (Server.Front), not the page's key, and always as one from
+// another machine (gateway.FromPagePort): it needs a gateway key and
+// magpie shared, from loopback too. This port is the one put behind a
+// proxy or a forward, and a raw TCP forward or a proxy that adds no
+// forwarding header arrives from loopback looking like an agent here
+// (reported privately by Coffemon). Agents here use the gateway's own
+// port. Everything else (the page, its /api/*) stays behind the page's
+// allow list and key.
 func onePort(page http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if !gateway.ClientPath(r.URL.Path) {
 			page.ServeHTTP(rw, r)
 			return
 		}
+		r = gateway.FromPagePort(r)
 		if gw := served.Load(); gw != nil {
 			gw.Front().ServeHTTP(rw, r)
 			return
@@ -409,10 +494,11 @@ func onePort(page http.Handler) http.Handler {
 // toGateway passes a client route on to the gateway another magpie serves
 // here (the service, the app), as it came: its Host, so a rebound page's
 // name is still refused, and its forwarding headers, so a request a proxy
-// passed on is still one from another machine. One from another machine
-// straight to this port gets the peer's address added as X-Forwarded-For,
-// as the gateway would otherwise see this process's loopback call and ask
-// it no key.
+// passed on is still one from another machine. It carries the page
+// port's mark (gateway.PagePortHeader, set by onePort), so the gateway
+// judges it as from another machine wherever it came from; and it always
+// carries an X-Forwarded-For (the peer's address added), so a gateway of
+// an older magpie, which doesn't know the mark, still does.
 var toGateway = &httputil.ReverseProxy{
 	Rewrite: func(pr *httputil.ProxyRequest) {
 		u, _ := url.Parse(gateway.URL())
@@ -426,6 +512,9 @@ var toGateway = &httputil.ReverseProxy{
 		}
 		if !loopbackPeer(pr.In.RemoteAddr) {
 			pr.SetXForwarded()
+		} else if pr.Out.Header.Get("X-Forwarded-For") == "" {
+			h, _, _ := net.SplitHostPort(pr.In.RemoteAddr)
+			pr.Out.Header.Set("X-Forwarded-For", h)
 		}
 	},
 	FlushInterval: -1, // streams as they come

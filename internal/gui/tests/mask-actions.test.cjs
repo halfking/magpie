@@ -2,7 +2,7 @@
 // Settings › Privacy says what is done with each kind of value found
 // (#1977): Mask, Warn or Block, saved as the kind's choice, Mask saved as
 // no choice at all; personal kinds behind Show all kinds; a Never mask
-// list saved whole; and Try it, which shows text as the vendor would get
+// list saved whole, a value a row; and Try it, which shows text as the vendor would get
 // it, what was found and what would be done, says a block holds the
 // request back, keeps the text nowhere in the browser and shows no value
 // the preview didn't hand back. Every language, Chromium and WebKit,
@@ -18,7 +18,7 @@ const assets = path.resolve(__dirname, "../assets");
 const SECRET = "sk-proj-Tr1eDq8Wm3Rt6YxN2vLp";
 const PH = "{{API_KEY_ab12cd34}}";
 
-function serve(lang, posted) {
+function serve(lang, posted, shown = { from: SECRET, to: PH }) {
   let settings = { theme: "light", lang, tray: "panel", redact: true, redactPersonal: true };
   return async (route) => {
     const req = route.request(), url = new URL(req.url());
@@ -45,7 +45,7 @@ function serve(lang, posted) {
       const { text } = req.postDataJSON();
       posted.push(["preview", text]);
       const block = settings.redactActions?.API_KEY === "block";
-      return json({ text: text.replace(SECRET, PH), hits: text.includes(SECRET) ? [{ kind: "API_KEY", by: "rule", action: block ? "block" : "", placeholder: PH, head: "sk-p", len: SECRET.length }] : [] });
+      return json({ text: text.replaceAll(shown.from, shown.to), hits: text.includes(shown.from) ? [{ kind: "API_KEY", by: "rule", action: block ? "block" : "", placeholder: shown.to, head: shown.from.slice(0, 4), len: shown.from.length }] : [] });
     }
     if (url.pathname.startsWith("/api/")) return json({});
     const file = path.join(assets, url.pathname === "/" ? "index.html" : url.pathname);
@@ -69,6 +69,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         t.after(() => browser.close());
         const page = await (await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" })).newPage();
         page.setDefaultTimeout(8000);
+        page.setDefaultNavigationTimeout(60000);
         const errors = [], posted = [];
         page.on("pageerror", (e) => errors.push(e.message));
         await page.route("**/*", serve(lang, posted));
@@ -104,14 +105,15 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.waitForFunction(() => !document.querySelector('#maskActList .mask-act[data-kind="EMAIL"] .sub.act-warn'));
         assert.deepEqual(posted.at(-1), ["actions", { actions: { API_KEY: "block" } }]);
 
-        // the allow list, split on commas and saved whole
-        const allow = acts.locator("input.mask-allow");
+        // the allow list, its add box split on commas, saved whole and
+        // drawn a value a row (wordList)
+        const allow = acts.locator('.word-list[data-list="allow"] input.word-add');
         await reach(page, allow);
         await allow.fill(" team@kelvarn.io，build-01 ,, ");
         await allow.press("Enter");
         for (let i = 0; i < 100 && !posted.some(([k]) => k === "allow"); i++) await page.waitForTimeout(40);
         assert.deepEqual(posted.filter(([k]) => k === "allow").at(-1), ["allow", { allow: ["team@kelvarn.io", "build-01"] }]);
-        await page.waitForFunction(() => document.querySelector("#maskActList input.mask-allow")?.value === "team@kelvarn.io, build-01");
+        await page.waitForFunction(() => [...document.querySelectorAll('#maskActList .word-list[data-list="allow"] input[data-word]')].map((i) => i.value).join("|") === "team@kelvarn.io|build-01");
 
         // Try it: the vendor's text, what was found, and that it is held back
         const box = page.locator("#maskTryList textarea.mask-try-in");
@@ -142,4 +144,33 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       });
     }
   }
+}
+
+// with "Keep a key's form" on the preview hands back a made-up key of the
+// real one's form, not a {{…}} placeholder: Try it marks it all the same,
+// and only it (#3599)
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  test(`${engine}: Try it marks a made-up key`, async (t) => {
+    const REAL = "sk_w3axCByTQgK1PxqPhfKTrJOLBqz6sbZv", MADE = "sk_hYQWRBFmdHNIo5XVT2VnIIGh4mmMiJNm";
+    const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+    t.after(() => browser.close());
+    const page = await (await browser.newContext({ viewport: { width: 1100, height: 900 }, reducedMotion: "reduce" })).newPage();
+    page.setDefaultTimeout(8000);
+    page.setDefaultNavigationTimeout(60000);
+    const errors = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+    await page.route("**/*", serve("en", [], { from: REAL, to: MADE }));
+    await watchSettingsReads(page);
+    await page.goto("http://magpie.test/?view=settings&tab=privacy");
+    await settingsDrawn(page);
+    const box = page.locator("#maskTryList textarea.mask-try-in");
+    await reach(page, box);
+    await box.fill(`OPENAI_API_KEY=${REAL} sk_not_found_here, again ${REAL}`);
+    const out = page.locator("#maskTryList .mask-try-out");
+    await out.locator(".mask-try-hits").waitFor();
+    assert.equal(await out.locator(".mask-try-text").textContent(), `OPENAI_API_KEY=${MADE} sk_not_found_here, again ${MADE}`);
+    assert.deepEqual(await out.locator("mark.mo-ph").allTextContents(), [MADE, MADE]);
+    assert.equal(await out.locator("mark.mo-ph").first().getAttribute("title"), "API keys");
+    assert.deepEqual(errors, []);
+  });
 }

@@ -342,7 +342,19 @@ func getURLOfficial(ctx context.Context, url string, limit int64) ([]byte, error
 	return getURLFrom(ctx, url, limit, false)
 }
 
+// getURLFrom reads url, once more over HTTP/1.1 when the connection broke
+// off (netproxy.AgainOverHTTP1): Bun's zip is tens of MB, which a proxy
+// that cuts HTTP/2 streams part way breaks on each try over HTTP/2.
 func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]byte, error) {
+	var b []byte
+	err := netproxy.AgainOverHTTP1(ctx, func(ctx context.Context) (err error) {
+		b, err = getURLOnce(ctx, url, limit, mirror)
+		return err
+	})
+	return b, err
+}
+
+func getURLOnce(ctx context.Context, url string, limit int64, mirror bool) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -374,9 +386,10 @@ func getURLFrom(ctx context.Context, url string, limit int64, mirror bool) ([]by
 
 // bunCommand runs bun with args in dir, the environment's proxy settings
 // passed on (a SOCKS5 one bridged, as Bun can't use it: #1409), the roots
-// the system trusts added to Bun's (caEnv), and npm's registry in China
-// with the 「国内镜像」 switch on (its packages are npm's own, checked
-// against the integrity npm gave).
+// the system trusts added to Bun's (caEnv), and the npm registry in use
+// where bun wouldn't find it itself (registryEnv): one set in magpie, the
+// login shell's, or npm's registry in China with the 「国内镜像」 switch on
+// (its packages are npm's own, checked against the integrity npm gave).
 var bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exec.Cmd {
 	cmd := command(ctx, bun, args...)
 	cmd.Dir = dir
@@ -384,19 +397,4 @@ var bunCommand = func(ctx context.Context, bun, dir string, args ...string) *exe
 	cmd.Env = append(cmd.Env, caEnv(cmd.Env, dir)...)
 	cmd.Env = append(cmd.Env, registryEnv(cmd.Env)...)
 	return cmd
-}
-
-// registryEnv is what has bun install from npm's registry in China, with
-// the switch on, unless the environment names a registry already.
-func registryEnv(env []string) []string {
-	if !source.China() {
-		return nil
-	}
-	for _, kv := range env {
-		k, v, _ := strings.Cut(kv, "=")
-		if k = strings.ToUpper(k); (k == "BUN_CONFIG_REGISTRY" || k == "NPM_CONFIG_REGISTRY") && strings.TrimSpace(v) != "" {
-			return nil
-		}
-	}
-	return []string{"BUN_CONFIG_REGISTRY=" + source.NPMMirror + "/"}
 }

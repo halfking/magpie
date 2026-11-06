@@ -120,6 +120,9 @@ func SourceOf(r Row) string {
 // keepsRow is keeps with the one dimension a Record does not carry: which of
 // the two sources the row is of (Row.Source, not the record's).
 func (f Filter) keepsRow(r *Row) bool {
+	if clearedNow().hides(&r.Record) { // the user's clears (cleared.go)
+		return false
+	}
 	if f.Through != "" && SourceOf(*r) != f.Through {
 		return false
 	}
@@ -256,6 +259,7 @@ func LedgerOfAt(p Period, f Filter, now time.Time) Ledgered {
 
 // ledgerOfAt is LedgerOfAt over the session files' calls reader reads.
 func ledgerOfAt(p Period, f Filter, now time.Time, reader func(time.Time) []sessions.Call) Ledgered {
+	readCleared() // the user's clears, which keepsRow leaves out
 	since := p.Since(now)
 	gatewaySince := since
 	if !since.IsZero() {
@@ -387,16 +391,16 @@ func gatewayMatchesDetails(recs []Record, logs []sessions.Call) (map[int]bool, m
 	}
 	duplicates, actors, compactions := duplicateCodexCalls(logs)
 	pairs := codexResponseMatches(recs, logs, duplicates)
-	deduplicate := map[rowRef]bool{}
+	deduplicate := refSet{}
 	for index := range duplicates {
-		deduplicate[rowRef{local, index}] = true
+		deduplicate.add(rowRef{local, index})
 	}
 	responsePairs := make(map[rowRef]rowRef, len(pairs))
 	for record, call := range pairs {
 		responsePairs[rowRef{gateway, record}] = rowRef{local, call}
 	}
 	matched := map[int]bool{}
-	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, deduplicate, responsePairs, time.Time{}, false) {
+	for ref := range matchedBlocks([]*rowChunk{gateway}, []*rowChunk{local}, deduplicate, responsePairs, time.Time{}, false).all() {
 		matched[ref.Index] = true
 	}
 	for index := range duplicates {
@@ -424,7 +428,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 	// the upstream names in force now, read once for the lot: a row is
 	// judged by the names standing today, which is what Ledger says, and
 	// the rows here are what a reader compares a bill against
-	wires := settings.Load().ModelWires
+	wires := settings.Load().Wires()
 	priceOf := Pricer()
 	codexIdentities := sessions.CodexIdentities()
 	rows = make([]Row, 0, len(recs)+len(logs))
@@ -441,7 +445,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if source == "" {
 			sent = provider.SentNameIn(wires, r.Provider, r.Model, r.Effort)
 		}
-		row := codexIdentityRow(Row{Record: r, Swapped: r.Served != "" && Swapped(sent, r.Served), Routed: GroupRouted(sent, r.Served), Source: source}, actor, codexIdentities)
+		row := codexIdentityRow(Row{Record: r, Swapped: r.Served != "" && Swapped(sent, r.Served) && !ListedAs(r.Provider, r.Model, r.Served), Routed: GroupRouted(sent, r.Served), Source: source}, actor, codexIdentities)
 		if !f.keepsRow(&row) {
 			return
 		}
@@ -459,7 +463,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if !since.IsZero() && r.Time.Before(since) || after(until, r.Time) {
 			continue
 		}
-		r.Provider = renamed.Of(r.Provider, r.Time)
+		r.renameBy(renamed)
 		actor := ""
 		if call, ok := pairs[i]; ok && call >= 0 && call < len(logs) {
 			actor = logs[call].ThreadID
@@ -494,7 +498,7 @@ func ledgerMatched(since, until time.Time, f Filter, recs []Record, logs []sessi
 		if !since.IsZero() && r.Time.Before(since) || after(until, r.Time) {
 			continue
 		}
-		r.Provider = renamed.Of(r.Provider, r.Time)
+		r.renameBy(renamed)
 		add(r, priceOf(r), c.Source, "")
 	}
 	// the two logs, by when each call began
@@ -516,12 +520,32 @@ var ownPrice catalog.Price
 // A model no price is known for is priced as the model the vendor's reply
 // said answered (Served), at the same provider, when that one has a price:
 // a relay that sells kimi-k3 as moonshot-kimi-k3 answers as kimi-k3, which
-// is listed (#1498). The model asked for keeps its own price whenever it
-// has one, a zero set by the user included, so a ledger that matched the
-// vendor's bill still does.
+// is listed (#1498). So is a call the vendor genuinely answered with
+// another model than the one asked for — the swap the ledger marks, no
+// rename in either name (#5340): the vendor billed for the one that ran,
+// and the asked-for model's rate describes nothing that happened. A price
+// the user set for the model asked for keeps its say either way, a zero
+// included, so a ledger that matched the vendor's bill still does, and a
+// served model with no price leaves the asked-for one's standing. A record
+// inside one of its provider's rate windows (#2463) is priced at that
+// window's rate, its own time read against the windows, so calls either
+// side of a boundary price apart.
+//
+// A local session's call has no provider of ours to price at (its billing
+// provider is the unknown one) but its file names the route it went
+// through; that name prices the call when the catalog lists the very model
+// id under it, and never otherwise: a name models.dev doesn't know, or
+// one whose other models alone would stand for this call's, prices
+// nothing (#4278).
 func Pricer() func(Record) *catalog.Price {
-	prices := map[[3]string]*catalog.Price{}
+	prices := map[[5]string]*catalog.Price{}
+	// each provider's rate windows as the same read of the prices saw
+	// them: the windows are held once (BasePriceIn), each record's rate
+	// read at its own time (provider.RateAt), so a window that opens
+	// mid-page prices only the calls inside it (#2463)
+	windows := map[string][]provider.RateWindow{}
 	s := settings.Load()
+	wires := s.Wires()
 	return func(r Record) *catalog.Price {
 		if r.OwnCost != nil {
 			return &ownPrice // CostAt answers its own cost (#1874)
@@ -530,23 +554,88 @@ func Pricer() func(Record) *catalog.Price {
 		if served == r.Model {
 			served = ""
 		}
-		k := [3]string{r.Provider, r.Model, served}
+		id := r.priceID()
+		k := [5]string{id, r.Model, served, r.SessionProvider, r.Effort}
 		if pr, ok := prices[k]; ok {
-			return pr
+			return atWindow(pr, windows[id], r.Time)
 		}
 		var pr *catalog.Price
-		v, ok := provider.EffectivePriceIn(s, r.Provider, r.Model)
+		var v catalog.Price
+		var ws []provider.RateWindow
+		var ok bool
+		// the swap the ledger marks: the reply named another model than
+		// asked, no rename of it (#5340)
+		if servedInstead(wires, id, r.Model, r.Effort, served) {
+			// a price the user set for the model asked for still says what
+			// that model costs them, a zero included
+			if v, ok, ws = provider.UserBasePriceIn(s, id, r.Model); !ok {
+				// the model that ran is priced as itself, what the vendor
+				// billed; with none, the asked-for one's price stands
+				if v, ok, ws = provider.BasePriceIn(s, id, served); !ok {
+					v, ok, ws = provider.BasePriceIn(s, id, r.Model)
+				}
+			}
+		} else {
+			v, ok, ws = provider.BasePriceIn(s, id, r.Model)
+		}
 		if !ok && served != "" {
-			v, ok = provider.EffectivePriceIn(s, r.Provider, served)
+			v, ok, ws = provider.BasePriceIn(s, id, served)
 		}
 		if ok {
 			pr = &v
-		} else {
+			windows[id] = ws
+		} else if r.Provider == UnknownProvider && r.SessionProvider != "" {
+			// A session file's usage entry names the provider the call went
+			// through (omp's model_usage: provider openrouter, model
+			// typesafe/jev-1.14, #4278), which its billing provider, the
+			// unknown one, never says. The name is the file's word for the
+			// route, not an account of ours, so it prices only what the
+			// catalog itself lists under it: this very model id, at that
+			// provider, at a price. A provider models.dev doesn't know, a
+			// model it lists that provider without, and a listing with no
+			// price are none: the row stays unpriced, its CSV cost empty,
+			// rather than priced at another entry's guess.
+			if v, ok := catalog.PriceOf(r.SessionProvider, r.Model); ok {
+				pr = &v
+				// the failed lookup's windows are the billing provider's,
+				// not the session provider's: none holds for this price
+				ws = nil
+			}
+		}
+		if pr == nil {
 			catalog.Missing() // models.dev may list it by now
 		}
 		prices[k] = pr
-		return pr
+		return atWindow(pr, ws, r.Time)
 	}
+}
+
+// servedInstead reports whether the vendor answered a call on model with
+// another model, served, and not the same one under a name of its own: the
+// swap the ledger marks (#5340). It is judged on the model the record is
+// priced by and on the name that went out (a provider's wires can send the
+// model under another id), and holds only when both read as another model,
+// so a row the ledger does not mark swapped is never priced as one.
+func servedInstead(wires map[string]string, providerID, model, effort, served string) bool {
+	if served == "" || !Swapped(model, served) || ListedAs(providerID, model, served) {
+		return false
+	}
+	sent := provider.SentNameIn(wires, providerID, model, effort)
+	return sent == model || Swapped(sent, served)
+}
+
+// atWindow prices one record: the base price at the rate of the window
+// the record's time falls in (#2463), the price itself when none holds
+// or no price is known.
+func atWindow(pr *catalog.Price, ws []provider.RateWindow, at time.Time) *catalog.Price {
+	if pr == nil {
+		return nil
+	}
+	if r := provider.RateAt(ws, at); r > 0 && r != 1 {
+		p := pr.Times(r)
+		return &p
+	}
+	return pr
 }
 
 // NewPricer totals requests' token-bearing attempts at one snapshot of the
@@ -557,7 +646,7 @@ func NewPricer() func([]Record) Totals {
 	return func(recs []Record) Totals {
 		var sum Totals
 		for _, r := range recs {
-			r.Provider = renamed.Of(r.Provider, r.Time)
+			r.renameBy(renamed)
 			sum.add(r, priceOf(r))
 		}
 		return sum
@@ -744,6 +833,7 @@ func (t *Totals) addRow(r Row) {
 	t.CacheWrite1h += r.CacheWrite1h
 	t.countCache(r.Record)
 	t.Reasoning += r.Reasoning
+	t.addBytes(&r.Record)
 	switch {
 	case r.Priced:
 		t.Cost += r.Cost
@@ -780,6 +870,9 @@ func (t *Totals) plus(d *Totals) {
 	t.FloorOut += d.FloorOut
 	t.FloorMs += d.FloorMs
 	t.FloorN += d.FloorN
+	t.UpBytes += d.UpBytes
+	t.DownBytes += d.DownBytes
+	t.ImageFilesSaved += d.ImageFilesSaved
 }
 
 // FloorAgents are the agents whose session files time a call from what
@@ -1114,13 +1207,19 @@ func ledgerSeriesAt(p Period, rows []Row, now time.Time) (bucket string, pts []S
 // does so itself).
 func Visit(since time.Time, fn func(Record)) { readLogSnapshot().visit(since, fn) }
 
+// VisitSessions is Visit for the records whose Session or NativeSession
+// is one of sessions, read without making a Record of any other.
+func VisitSessions(since time.Time, sessions []string, fn func(Record)) {
+	readLogSnapshot().visitSessions(since, sessions, fn)
+}
+
 // NewCoster prices one record at a time at the effective prices the
 // ledger uses, read once: its cost in USD, and false for a call with
 // tokens but no known price.
 func NewCoster() func(Record) (float64, bool) {
 	priceOf, renamed := Pricer(), provider.UsageRenames()
 	return func(r Record) (float64, bool) {
-		r.Provider = renamed.Of(r.Provider, r.Time)
+		r.renameBy(renamed)
 		var t Totals
 		t.add(r, priceOf(r))
 		return t.Cost, t.Unpriced == 0

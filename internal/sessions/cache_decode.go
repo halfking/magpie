@@ -26,9 +26,22 @@ func decodeCache(b []byte, zone string) (map[string]*state, bool) {
 	}
 	// b is never changed, and nothing read from it is kept but cloned keys
 	s := unsafe.String(unsafe.SliceData(b), len(b))
-	head := gjson.GetMany(s, "version", "zone", "files")
+	head := gjson.GetMany(s, "version", "zone", "files", "parsers")
 	if head[0].Type != gjson.Number || head[0].Int() != cacheVersion || head[1].String() != zone || !head[2].IsObject() {
 		return nil, false
+	}
+	was := map[string]int{}
+	head[3].ForEach(func(k, v gjson.Result) bool {
+		was[k.String()] = int(v.Int())
+		return true
+	})
+	// a parse of no named agent stands only when no agent's version moved
+	unnamed := true
+	for a, v := range was {
+		unnamed = unnamed && parseVersions[a] == v
+	}
+	for a, v := range parseVersions {
+		unnamed = unnamed && was[a] == v
 	}
 	var keys, raws []string
 	head[2].ForEach(func(k, v gjson.Result) bool {
@@ -74,6 +87,12 @@ func decodeCache(b []byte, zone string) (map[string]*state, bool) {
 	for i, k := range keys {
 		files[k] = parsed[i] // a key given twice is its last, as Unmarshal has it
 	}
+	for k, p := range files {
+		// made by another version of its agent's parser: read again
+		if p != nil && (p.Agent == "" && !unnamed || p.Agent != "" && was[p.Agent] != parseVersions[p.Agent]) {
+			delete(files, k)
+		}
+	}
 	return files, true
 }
 
@@ -92,9 +111,10 @@ func encodeCache(w io.Writer, c cacheFile) error {
 		return nil
 	}
 	if err := put(struct {
-		Version int    `json:"version"`
-		Zone    string `json:"zone"`
-	}{c.Version, c.Zone}); err != nil {
+		Version int            `json:"version"`
+		Zone    string         `json:"zone"`
+		Parsers map[string]int `json:"parsers,omitempty"`
+	}{c.Version, c.Zone, c.Parsers}); err != nil {
 		return err
 	}
 	b.Truncate(b.Len() - 1)
@@ -149,10 +169,8 @@ func (st *state) share() {
 	// models as its own: held once, they were ~10 of the 28MB kept. A kept
 	// state is never written: a parse writes a clone, which holds them apart.
 	if len(st.Days) == 1 {
-		for _, d := range st.Days {
-			if len(d.Models) == len(st.Models) && maps.Equal(d.Models, st.Models) {
-				d.Models = st.Models
-			}
+		if d := st.Days[0].v; d != nil && slices.Equal(d.Models, st.Models) {
+			d.Models = st.Models
 		}
 	}
 }
