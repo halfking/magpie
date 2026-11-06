@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,6 +35,7 @@ import (
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
+	"github.com/yetone/magpie/internal/rosetta"
 	"github.com/yetone/magpie/internal/source"
 )
 
@@ -80,9 +82,10 @@ func proxied() http.RoundTripper {
 func Latest(ctx context.Context) (*Release, error) { return LatestIn(ctx, "") }
 
 // LatestIn asks the feed for the newest release, its notes in lang (see
-// InLang): the app's language, which What's new follows.
+// InLang): the app's language, which What's new follows. On Settings'
+// Stable channel it is Stable's release (see Stable).
 func LatestIn(ctx context.Context, lang string) (*Release, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", withLang(Feed(), lang), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", withChannel(withLang(Feed(), lang)), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -197,14 +200,35 @@ func parse(v string) *semver {
 // one.
 var GUI bool
 
-// AppAsset and BinaryAsset name the files this machine would install.
-func AppAsset() string { return "magpie-darwin-" + runtime.GOARCH + ".zip" }
-func BinaryAsset() string {
-	name := "magpie-cli-" + runtime.GOOS + "-" + runtime.GOARCH
-	if GUI && runtime.GOOS != "darwin" {
-		name = "magpie-" + runtime.GOOS + "-" + runtime.GOARCH
+// goos and goarch are the system this magpie was built for, and
+// translated says it runs under Rosetta; tests set them.
+var (
+	goos, goarch = runtime.GOOS, runtime.GOARCH
+	translated   = rosetta.Translated
+)
+
+// arch is the architecture an update installs: this build's, but Apple
+// silicon's for an Intel magpie under Rosetta. Kept on the Intel build,
+// such a Mac ran the local masking model in Go under translation, with no
+// CoreML, at 150% of a core (cdredfox on Discord), and every update
+// fetched the Intel build again. Installing Apple silicon's is the same
+// swap: the zip's magpie.app is renamed over the bundle, signed by the
+// same team (sameSigner), and the bare binary is renamed over itself.
+func arch() string {
+	if goos == "darwin" && goarch == "amd64" && translated() {
+		return "arm64"
 	}
-	if runtime.GOOS == "windows" {
+	return goarch
+}
+
+// AppAsset and BinaryAsset name the files this machine would install.
+func AppAsset() string { return "magpie-darwin-" + arch() + ".zip" }
+func BinaryAsset() string {
+	name := "magpie-cli-" + goos + "-" + arch()
+	if GUI && goos != "darwin" {
+		name = "magpie-" + goos + "-" + arch()
+	}
+	if goos == "windows" {
 		name += ".exe"
 	}
 	return name
@@ -256,7 +280,8 @@ func Writable(dir string) bool {
 }
 
 // Stage downloads the app in rel and unpacks it next to the installed
-// bundle, ready for Install. It returns the unpacked app.
+// bundle, ready for Install. It returns the unpacked app, a bundle whose
+// folder is named stagedName.
 func Stage(ctx context.Context, rel *Release, bundle string) (string, error) {
 	a, ok := rel.Assets[AppAsset()]
 	if !ok {
@@ -272,13 +297,23 @@ func Stage(ctx context.Context, rel *Release, bundle string) (string, error) {
 		os.RemoveAll(dir)
 		return "", err
 	}
-	out := filepath.Join(dir, "app")
+	out := filepath.Join(dir, "unzip")
 	if b, err := proc.CommandContext(ctx, "ditto", "-x", "-k", zip, out).CombinedOutput(); err != nil {
 		os.RemoveAll(dir)
 		return "", fmt.Errorf("unzip: %v: %s", err, b)
 	}
 	os.Remove(zip)
-	app := filepath.Join(out, "magpie.app")
+	// the zip holds magpie.app, which leaves that name at once: a folder
+	// ending in .app beside the installed one is taken by LaunchServices
+	// for a second magpie, and Spotlight lists it after it is gone (#3965)
+	unzipped := filepath.Join(out, "magpie.app")
+	app := filepath.Join(dir, stagedName)
+	if err := os.Rename(unzipped, app); err != nil {
+		os.RemoveAll(dir)
+		return "", err
+	}
+	os.Remove(out)
+	unregister(unzipped) // in case it looked in that moment
 	if err := sameSigner(ctx, bundle, app); err != nil {
 		os.RemoveAll(dir)
 		return "", err
@@ -309,6 +344,15 @@ func team(ctx context.Context, app string) string {
 	return ""
 }
 
+// stagedName is what the new app is unpacked as in stageDir, and asideName
+// what the installed one is moved to while they are swapped. Neither ends
+// in .app, so LaunchServices never registers either as a second magpie
+// (#3965); the renames don't need the name, and stay on one volume.
+const (
+	stagedName = "payload"
+	asideName  = "old"
+)
+
 // stageDir is where an update is unpacked: beside what it replaces, so
 // installing it is a rename on one volume, or, where magpie may not write,
 // in its cache, to be moved in with the administrator's password.
@@ -326,7 +370,7 @@ func stageDir(dir string) string {
 // magpie's to change the error is a permission one (NeedsAdmin), and
 // InstallAsAdmin can do it instead.
 func Install(staged, bundle string) error {
-	old := filepath.Join(filepath.Dir(staged), "old.app")
+	old := filepath.Join(filepath.Dir(staged), asideName)
 	os.RemoveAll(old)
 	if err := os.Rename(bundle, old); err != nil {
 		return err
@@ -335,17 +379,17 @@ func Install(staged, bundle string) error {
 		os.Rename(old, bundle) // put it back
 		return err
 	}
-	os.RemoveAll(filepath.Dir(filepath.Dir(staged))) // .magpie-update
+	os.RemoveAll(filepath.Dir(staged)) // .magpie-update
 	return nil
 }
 
 // InstallAsAdmin is Install with the administrator's password, asked for
 // by the system.
 func InstallAsAdmin(staged, bundle string) error {
-	old := filepath.Join(filepath.Dir(staged), "old.app")
+	old := filepath.Join(filepath.Dir(staged), asideName)
 	err := asAdmin(swapScript(staged, bundle, old))
 	if err == nil {
-		os.RemoveAll(filepath.Dir(filepath.Dir(staged)))
+		os.RemoveAll(filepath.Dir(staged))
 	}
 	return err
 }
@@ -354,9 +398,11 @@ func InstallAsAdmin(staged, bundle string) error {
 // window when window is set, else only its menu bar icon (`tray`, as a
 // login launch), which a restart by itself uses while no window was up.
 // Each try, and what it came to, is written to relaunch.log in magpie's
-// own folder.
-func Relaunch(bundle string, window bool) error {
-	return runAfterExit(os.Getpid(), relaunchCommand(bundle, window, relaunchLog()))
+// own folder. quiet, the restart is one magpie made by itself: the app
+// opens in the background (open -g), as it does too with no window, so it
+// takes no focus from the app the user is in (relaunchOpen).
+func Relaunch(bundle string, window, quiet bool) error {
+	return runAfterExit(os.Getpid(), relaunchCommand(bundle, window, quiet, relaunchLog()))
 }
 
 // openWaits are the pauses, in seconds, between tries of the relaunch's
@@ -398,12 +444,12 @@ func relaunchLog() string {
 // even with the 13s of tries (molvqingtai, after fb23bca5c): LaunchServices
 // can go on refusing the open for as long as the session is locked, and a
 // program run by its path needs nothing from it to start.
-func relaunchCommand(bundle string, window bool, log string) string {
-	return relaunchScript(bundle, window, log, openWaits)
+func relaunchCommand(bundle string, window, quiet bool, log string) string {
+	return relaunchScript(bundle, window, quiet, log, openWaits)
 }
 
 // relaunchScript is relaunchCommand with the pauses between opens.
-func relaunchScript(bundle string, window bool, log string, waits []string) string {
+func relaunchScript(bundle string, window, quiet bool, log string, waits []string) string {
 	if log == "" {
 		log = os.DevNull
 	}
@@ -416,7 +462,7 @@ func relaunchScript(bundle string, window bool, log string, waits []string) stri
 	b.WriteString("log=" + shellQuote(log) + "; ")
 	b.WriteString(`note() { echo "$(date '+%Y-%m-%d %H:%M:%S %z') $*" >> "$log" 2>/dev/null; }; `)
 	// open's own exit status and what it said, on one line
-	b.WriteString(`try() { n=$((n+1)); e=$(` + relaunchOpen(bundle, window) + ` 2>&1 >/dev/null); s=$?; note "open try $n: exit $s $(printf '%s' "$e" | tr '\n' ' ')"; return $s; }; `)
+	b.WriteString(`try() { n=$((n+1)); e=$(` + relaunchOpen(bundle, window, quiet) + ` 2>&1 >/dev/null); s=$?; note "open try $n: exit $s $(printf '%s' "$e" | tr '\n' ' ')"; return $s; }; `)
 	b.WriteString("n=0; note " + shellQuote("magpie has exited; opening "+bundle) + "; ")
 	b.WriteString(retried("try", waits))
 	b.WriteString(" || { note \"open gave up after $n tries; starting \"" + shellQuote(run) + "; ")
@@ -466,7 +512,7 @@ func runAfterExit(pid int, command string) error {
 	cmd := proc.Command("/bin/sh", "-c", script)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	detach(cmd)
-	return cmd.Start()
+	return proc.StartReaped(cmd)
 }
 
 // relaunchOpen is the open command Relaunch runs for bundle. -n asks
@@ -479,11 +525,27 @@ func runAfterExit(pid int, command string) error {
 // macOS 27.0.1, v0.1.1308), as often as it is tried. A magpie that is in
 // fact up still has the one instance: the new process finds the instance
 // lock held and hands over to it (runningAlready in internal/gui).
-func relaunchOpen(bundle string, window bool) string {
-	if window {
-		return fmt.Sprintf("open -n %q", bundle)
+//
+// -g opens it in the background, unless it comes back with its window on
+// a restart the user asked for. Without it, LaunchServices brings magpie
+// to the front as it starts: a restart into an update with only the menu
+// bar icon to come back, or one magpie made by itself (Settings'
+// AutoRestart), took the focus from the app the user was typing in
+// (xyxyxy_15591 on Discord).
+func relaunchOpen(bundle string, window, quiet bool) string {
+	return openCommand(bundle, window, quiet)
+}
+
+// openCommand is the open of relaunchOpen and openBeside.
+func openCommand(bundle string, window, quiet bool) string {
+	g := ""
+	if quiet || !window {
+		g = "-g "
 	}
-	return fmt.Sprintf("open -n %q --args tray", bundle)
+	if window {
+		return fmt.Sprintf("open -n %s%q", g, bundle)
+	}
+	return fmt.Sprintf("open -n %s%q --args tray", g, bundle)
 }
 
 // ReplaceBinary puts the release's build for this binary where the
@@ -504,8 +566,8 @@ func ReplaceBinary(ctx context.Context, rel *Release) error {
 	return err
 }
 
-// StageBinary downloads the release's build for this binary next to it (or
-// to the cache, where magpie may not write there), ready for InstallBinary.
+// StageBinary downloads the release's build for this binary out of sight
+// (binaryStage), ready for InstallBinary.
 func StageBinary(ctx context.Context, rel *Release) (string, error) {
 	a, ok := rel.Assets[BinaryAsset()]
 	if !ok {
@@ -515,22 +577,144 @@ func StageBinary(ctx context.Context, rel *Release) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tmp := exe + ".new"
-	if !Writable(filepath.Dir(exe)) {
-		dir := stageDir(filepath.Dir(exe))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", err
-		}
-		tmp = filepath.Join(dir, filepath.Base(exe)+".new")
+	return stageBinaryFor(ctx, a, exe)
+}
+
+func stageBinaryFor(ctx context.Context, a Asset, exe string) (string, error) {
+	tmp, err := binaryStage(exe)
+	if err != nil {
+		return "", err
 	}
 	if err := download(ctx, a, tmp); err != nil {
+		dropStage(tmp)
 		return "", err
 	}
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		os.Remove(tmp)
+		dropStage(tmp)
 		return "", err
 	}
 	return tmp, nil
+}
+
+// The GUI downloads an update when it is out and swaps it in at the next
+// restart, which may be days later. It was downloaded beside the program
+// as magpie.exe.new, so a magpie kept on the Desktop showed the download
+// there, and deleted, it came back with the next check (nianshou5 on
+// Discord). It is downloaded to magpie's cache now, in a folder of this
+// program's own, whenever a rename from there reaches the program's
+// folder, which is what puts it in; else (the cache on another volume)
+// into a hidden .magpie-update folder beside the program. Where magpie may
+// not write beside the program, it goes to the cache as before, to be
+// moved in with the administrator's password.
+
+// besideStage is the hidden folder beside the program an update is
+// downloaded into when no rename from the cache reaches the program.
+const besideStage = ".magpie-update"
+
+// stageCache is magpie's cache folder; tests set it.
+var stageCache = appdir.SystemCache
+
+// binaryStage is the file StageBinary downloads exe's new build to, its
+// folder made.
+func binaryStage(exe string) (string, error) {
+	dir, name := filepath.Dir(exe), filepath.Base(exe)+".new"
+	if !Writable(dir) {
+		d := stageDir(dir)
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return "", err
+		}
+		return freshStage(d, name)
+	}
+	if d := cacheStage(exe); d != "" && os.MkdirAll(d, 0o755) == nil {
+		if renamesInto(d, dir) {
+			return freshStage(d, name)
+		}
+		os.Remove(d)
+	}
+	d := filepath.Join(dir, besideStage)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		return "", err
+	}
+	hide(d)
+	return freshStage(d, name)
+}
+
+// freshStage is name in d, what an earlier download left there removed;
+// when that can't go (on Windows a scanner may hold a new exe open for
+// minutes, mycf_711 on Discord), a name of its own beside it, name-*,
+// which stagedFiles finds for the next start to remove.
+func freshStage(d, name string) (string, error) {
+	p := filepath.Join(d, name)
+	if clearFile(p) == nil {
+		return p, nil
+	}
+	f, err := os.CreateTemp(d, name+"-*")
+	if err != nil {
+		return "", err
+	}
+	f.Close()
+	return f.Name(), nil
+}
+
+// cacheStage is exe's own folder in the cache for its downloads, "" with
+// no cache: two copies of magpie (a portable one and the installed one)
+// never share one.
+func cacheStage(exe string) string {
+	cache, err := stageCache()
+	if err != nil || cache == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(filepath.Clean(exe))))
+	return filepath.Join(cache, "update", hex.EncodeToString(sum[:6]))
+}
+
+// renamesInto says whether a file in from can be renamed into dir: the
+// same volume, which a move that can't fail half way needs.
+func renamesInto(from, dir string) bool {
+	f, err := os.CreateTemp(from, ".magpie-update-*")
+	if err != nil {
+		return false
+	}
+	f.Close()
+	to := filepath.Join(dir, filepath.Base(f.Name()))
+	if err := os.Rename(f.Name(), to); err != nil {
+		os.Remove(f.Name())
+		return false
+	}
+	os.Remove(to)
+	return true
+}
+
+// dropStage removes the folder a staged download was in once it is empty,
+// when it is one binaryStage made.
+func dropStage(staged string) {
+	d := filepath.Dir(staged)
+	if filepath.Base(d) == besideStage || (len(filepath.Base(d)) == 12 && filepath.Base(filepath.Dir(d)) == "update") {
+		os.Remove(d)
+	}
+}
+
+// stagedFiles are the places a download of exe's next build may be: where
+// binaryStage puts it, under its name or one of freshStage's beside it,
+// and beside exe as exe.new, where earlier versions put it.
+func stagedFiles(exe string) []string {
+	name := filepath.Base(exe) + ".new"
+	out := []string{exe + ".new"}
+	dirs := []string{filepath.Join(filepath.Dir(exe), besideStage)}
+	if d := cacheStage(exe); d != "" {
+		dirs = append(dirs, d)
+	}
+	for _, d := range dirs {
+		out = append(out, filepath.Join(d, name))
+		es, _ := os.ReadDir(d)
+		for _, e := range es {
+			if strings.HasPrefix(e.Name(), name+"-") && e.Type().IsRegular() {
+				out = append(out, filepath.Join(d, e.Name()))
+			}
+		}
+	}
+	return out
 }
 
 // InstallBinary swaps a staged binary in for exe, the running one, which
@@ -552,8 +736,13 @@ func InstallBinaryAside(staged, exe string) (string, error) {
 		// one doesn't start it again, which would have an antivirus that
 		// checks a program as it starts hold it again for the move below
 		if !trialled.passed(staged) {
-			if err := canStart(staged); err != nil {
+			if err := tryStart(staged); heldOpen(err) {
+				// held, not refused: kept, for a restart to try again
+				// once whatever holds it lets go
+				return "", &saidError{"couldn't start the new version to check it: another program still has the download open (often an antivirus checking it); restart to update again in a minute, or let magpie through it", err}
+			} else if err != nil {
 				os.Remove(staged)
+				dropStage(staged)
 				return "", &BlockedError{Err: err}
 			}
 			trialled.note(staged)
@@ -581,9 +770,11 @@ func InstallBinaryAside(staged, exe string) (string, error) {
 			}
 		} else if !NeedsAdmin(err) { // kept for InstallBinaryAsAdmin
 			os.Remove(staged)
+			dropStage(staged)
 		}
 		return "", err
 	}
+	dropStage(staged)
 	return old, nil
 }
 
@@ -634,6 +825,21 @@ func waitHeld(i int, err error, start time.Time, retry bool) bool {
 	}
 	time.Sleep(pause)
 	return true
+}
+
+// tryStart is canStart, tried again while another program holds the
+// download open, as moveIn waits for it: a scanner that checks a new
+// program holds its file from the moment it is written, and Windows then
+// won't start it ("being used by another process"), which is no refusal
+// of the program (mycf_711 on Discord).
+func tryStart(staged string) error {
+	start := time.Now()
+	for i := 0; ; i++ {
+		err := canStart(staged)
+		if err == nil || !waitHeld(i, err, start, heldOpen(err)) {
+			return err
+		}
+	}
 }
 
 // trialled is the download canStart last let through, by path, size and
@@ -764,17 +970,30 @@ func Replaced(exe string, started os.FileInfo) bool {
 	return err == nil && started != nil && (now.Size() != started.Size() || !now.ModTime().Equal(started.ModTime()))
 }
 
-// RemoveStaleNew removes exe.new when it is exe over again: the update a
-// magpie left running from before it downloaded once more.
+// RemoveStaleNew removes a download of exe's next build (stagedFiles)
+// that is no newer than exe: exe over again (the update a magpie left
+// running from before it downloaded once more), or an older version a
+// swap never put in. A newer one, which a magpie still running may yet
+// put in, stays.
 func RemoveStaleNew(exe string) {
-	staged := exe + ".new"
-	a, err1 := os.Stat(exe)
-	b, err2 := os.Stat(staged)
-	if err1 != nil || err2 != nil || a.Size() != b.Size() {
-		return
+	mine := fileVersion(exe)
+	for _, staged := range stagedFiles(exe) {
+		if !exists(staged) {
+			continue
+		}
+		if v := fileVersion(staged); sameBytes(exe, staged) || (mine != 0 && v != 0 && v <= mine) {
+			os.Remove(staged)
+		}
+		dropStage(staged)
 	}
-	if ha, hb := fileHash(exe), fileHash(staged); ha != "" && ha == hb {
+}
+
+// removeStaged removes every download of exe's next build: what nothing
+// will put in.
+func removeStaged(exe string) {
+	for _, staged := range stagedFiles(exe) {
 		os.Remove(staged)
+		dropStage(staged)
 	}
 }
 
@@ -851,81 +1070,221 @@ func WithProgress(ctx context.Context, f func(done, total int64)) context.Contex
 	return context.WithValue(ctx, progressKey{}, f)
 }
 
+// retryWaits are the pauses before each try after the first: a
+// connection that drops at the start or part way (GitHub's asset host from
+// some networks: AIMetaPhD on X, "EOF" at 0.1.1618) is tried again, from
+// where it broke off. A var for tests.
+var retryWaits = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second}
+
 // download fetches a to path and checks its hash. A connection that drops
-// part way — GitHub from some networks — gets two more tries.
+// is tried again after each of retryWaits, over HTTP/1.1 (OverHTTP1),
+// asking with Range for what is still missing; the hash is checked over the whole file, the bytes kept
+// from the tries before included.
 func download(ctx context.Context, a Asset, path string) error {
 	if a.SHA256 == "" {
 		return errors.New("the release lists no checksum for " + filepath.Base(path))
 	}
+	// a file left by an earlier run is no part of this one; one that can't
+	// go is said so here, not asked to go on from its end (416)
+	if err := clearFile(path); err != nil {
+		return err
+	}
 	var err error
-	for try := 0; try < 3; try++ {
+	for try := 0; try <= len(retryWaits); try++ {
 		if try > 0 {
 			select {
 			case <-ctx.Done():
 				return err
-			case <-time.After(time.Duration(try) * 2 * time.Second):
+			case <-time.After(retryWaits[try-1]):
 			}
 		}
-		if err = fetch(ctx, a, path); err == nil || ctx.Err() != nil {
+		if err = fetch(ctx, a, path); err == nil || ctx.Err() != nil || !Network(err) {
 			break
+		}
+		// the tries after a connection that broke go over HTTP/1.1: a
+		// proxy that cuts HTTP/2 streams part way cuts every try made
+		// over it the same way, while HTTP/1.1 through it holds
+		// (biubiu8802 on X: "unexpected EOF" on each try)
+		ctx = netproxy.OverHTTP1(ctx)
+	}
+	if err != nil {
+		if cerr := clearFile(path); cerr != nil {
+			err = errors.Join(err, cerr)
 		}
 	}
 	return err
 }
 
+// removeFile is os.Remove; tests have it fail as a file another program
+// holds open does on Windows.
+var removeFile = os.Remove
+
+// clearFile removes what an earlier download left at path, nil when
+// nothing is there. One that can't go is an error that says why, never
+// passed over: a download that went on into it would ask for the bytes
+// past its end, which no host can send (416), and fail the same way on
+// every try after (mycf_711 on Discord, held by a scanner for minutes).
+func clearFile(path string) error {
+	err := removeFile(path)
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if heldOpen(err) {
+		return &saidError{fmt.Sprintf("couldn't clear the earlier download %s: another program has it open (often an antivirus checking it); check for updates again in a minute", filepath.Base(path)), err}
+	}
+	return fmt.Errorf("couldn't clear the earlier download %s: %w", filepath.Base(path), err)
+}
+
+// NetError is a download the network broke off: the connection failed or
+// dropped part way. It names the file and the cause, never the address:
+// GitHub's redirect is a signed URL, hundreds of characters of signature
+// and token that say nothing to the user.
+type NetError struct {
+	File string
+	Err  error
+}
+
+func (e *NetError) Error() string {
+	cause := e.Err
+	var ue *url.Error
+	if errors.As(cause, &ue) {
+		cause = ue.Err
+	}
+	return fmt.Sprintf("the download of %s broke off (%v)", e.File, cause)
+}
+
+func (e *NetError) Unwrap() error { return e.Err }
+
+// Network reports whether err is a download the network broke off, which
+// trying again may get through.
+func Network(err error) bool { return errors.As(err, new(*NetError)) }
+
+// fetch downloads a to path, or the rest of it when path holds the start
+// already (a try before broke off): what is there is asked for no more
+// (Range), and a host that sends the whole file again has it written from
+// the beginning. A try the network breaks off keeps what came, for the next
+// one; any other failure removes it.
 func fetch(ctx context.Context, a Asset, path string) error {
 	// through a mirror when one is given (mirror.go): the hash checked
 	// below is still the feed's
 	u := mirrored(mirrorOf(ctx), a.URL)
-	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-	if err != nil {
-		return err
+	mirror := strings.TrimSuffix(u, a.URL)
+	name := filepath.Base(path)
+	var have int64
+	if fi, err := os.Stat(path); err == nil && fi.Mode().IsRegular() {
+		have = fi.Size()
 	}
-	res, err := source.Do(client, req)
-	if err != nil {
-		if u != a.URL {
-			return &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: err}
+	fail := func(err error) error {
+		if !Network(err) {
+			os.Remove(path) // what stays, download clears or says it can't
+		}
+		if u != a.URL && !errors.As(err, new(*MirrorError)) {
+			err = &MirrorError{Mirror: mirror, Err: err}
 		}
 		return err
+	}
+	// the whole file came on a try before (the connection broke after its
+	// last byte): there is nothing left to ask for, and a Range from its
+	// end is one no host can satisfy (416); the hash says whether it is
+	// the release's, and one that isn't is fetched again from the start
+	if a.Size > 0 && have >= a.Size {
+		if have == a.Size && strings.EqualFold(fileHash(path), a.SHA256) {
+			if report, ok := ctx.Value(progressKey{}).(func(done, total int64)); ok {
+				report(have, have)
+			}
+			return nil
+		}
+		have = 0
+	}
+	var res *http.Response
+	flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	for restarted := false; ; restarted = true {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return err
+		}
+		if have > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
+		}
+		res, err = source.Do(client, req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return fail(err)
+			}
+			return fail(&NetError{File: name, Err: err})
+		}
+		if res.StatusCode == http.StatusRequestedRangeNotSatisfiable && have > 0 && !restarted {
+			// what was kept isn't the start of the file the host has (it
+			// changed, or the feed's size is off): once more, whole
+			res.Body.Close()
+			have = 0
+			continue
+		}
+		break
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 {
+	switch {
+	case res.StatusCode == http.StatusPartialContent && have > 0 && strings.HasPrefix(res.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-", have)):
+		flag = os.O_WRONLY | os.O_APPEND
+	case res.StatusCode == http.StatusOK:
+		have = 0 // the whole file again
+	default:
 		if u != a.URL {
-			return &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: fmt.Errorf("download %s through the mirror %s: %s", filepath.Base(path), strings.TrimSuffix(u, a.URL), res.Status)}
+			return fail(&MirrorError{Mirror: mirror, Err: fmt.Errorf("download %s through the mirror %s: %s", name, mirror, res.Status)})
 		}
-		return fmt.Errorf("download %s: %s", filepath.Base(path), res.Status)
+		return fail(fmt.Errorf("download %s: %s", name, res.Status))
 	}
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, flag, 0o644)
 	if err != nil {
-		return err
+		return fail(err)
 	}
-	h := sha256.New()
-	var body io.Reader = res.Body
+	// a read that fails is the network's; a write that fails (a full
+	// disk) is not, and isn't tried again
+	in := &readErr{r: res.Body}
+	var body io.Reader = in
 	if report, ok := ctx.Value(progressKey{}).(func(done, total int64)); ok {
 		total := res.ContentLength
-		if total <= 0 {
+		if total > 0 {
+			total += have
+		} else {
 			total = a.Size
 		}
-		body = &counter{r: res.Body, total: max(total, 0), report: report}
-		report(0, max(total, 0))
+		body = &counter{r: in, done: have, total: max(total, 0), report: report}
+		report(have, max(total, 0))
 	}
-	_, err = io.Copy(io.MultiWriter(f, h), body)
+	_, err = io.Copy(f, body)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
-	if err == nil && !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), a.SHA256) {
-		err = fmt.Errorf("%s does not match its checksum", filepath.Base(path))
-		if u != a.URL {
-			err = fmt.Errorf("%s from the mirror %s does not match its checksum from %s; not installed", filepath.Base(path), strings.TrimSuffix(u, a.URL), Site)
-		}
-	}
-	if err != nil && u != a.URL && !errors.As(err, new(*MirrorError)) {
-		err = &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: err}
-	}
 	if err != nil {
-		os.Remove(path)
+		if ctx.Err() == nil && in.err != nil {
+			err = &NetError{File: name, Err: err}
+		}
+		return fail(err)
 	}
-	return err
+	// the whole file, what earlier tries kept included, against the feed's
+	if !strings.EqualFold(fileHash(path), a.SHA256) {
+		err = fmt.Errorf("%s does not match its checksum", name)
+		if u != a.URL {
+			err = fmt.Errorf("%s from the mirror %s does not match its checksum from %s; not installed", name, mirror, Site)
+		}
+		return fail(err)
+	}
+	return nil
+}
+
+// readErr keeps the error its reader returned, io.EOF aside.
+type readErr struct {
+	r   io.Reader
+	err error
+}
+
+func (r *readErr) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if err != nil && err != io.EOF {
+		r.err = err
+	}
+	return n, err
 }
 
 // counter reports bytes as they are read.
@@ -949,20 +1308,18 @@ func Alive(pid int) bool { return alive(pid) }
 // OpenBeside opens bundle now, a new instance beside this one (open -n),
 // tried again while open fails: a restart that hands the gateway over
 // (internal/handoff) starts the new version before this one quits. With
-// window, its window; else its menu bar icon only, as Relaunch.
-func OpenBeside(bundle string, window bool) error {
-	cmd := proc.Command("/bin/sh", "-c", retried(openBeside(bundle, window), openWaits))
+// window, its window; else its menu bar icon only, as Relaunch, in the
+// background as Relaunch's when quiet or with no window.
+func OpenBeside(bundle string, window, quiet bool) error {
+	cmd := proc.Command("/bin/sh", "-c", retried(openBeside(bundle, window, quiet), openWaits))
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
 	detach(cmd)
-	return cmd.Start()
+	return proc.StartReaped(cmd)
 }
 
 // openBeside is the open command OpenBeside runs for bundle.
-func openBeside(bundle string, window bool) string {
-	if window {
-		return fmt.Sprintf("open -n %q", bundle)
-	}
-	return fmt.Sprintf("open -n %q --args tray", bundle)
+func openBeside(bundle string, window, quiet bool) string {
+	return openCommand(bundle, window, quiet)
 }
 
 // StartBeside starts exe now, beside this process, as RelaunchBinary's

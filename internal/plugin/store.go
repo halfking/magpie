@@ -34,6 +34,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/proc"
@@ -83,7 +85,37 @@ var installMu sync.Mutex
 func runBun(ctx context.Context, bun string, args ...string) ([]byte, error) {
 	installMu.Lock()
 	defer installMu.Unlock()
+	mendPackageJSON()
+	defer mendPackageJSON()
+	mendDist(ctx, bun)
 	return bunCommand(ctx, bun, Dir(), args...).CombinedOutput()
+}
+
+// mendPackageJSON cuts what follows plugins/package.json's object off. Bun
+// on Windows can write a shorter package.json over a longer one without
+// truncating it (klmno1993, plugins#405: a bun remove left the old file's
+// last 56 bytes after the closing brace), and every bun add after it
+// fails on bun's "failed to read/parse package.json", whatever
+// the plugin. The object is kept as written; the whole file is kept as
+// package.json.broken. A file whose start isn't an object is left alone.
+// installMu held.
+func mendPackageJSON() {
+	pj := filepath.Join(Dir(), "package.json")
+	b, err := os.ReadFile(pj)
+	if err != nil || json.Valid(b) {
+		return
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	var obj map[string]any
+	if d.Decode(&obj) != nil || obj == nil {
+		return
+	}
+	head := append(bytes.Clone(bytes.TrimRight(b[:d.InputOffset()], " \t\r\n")), '\n')
+	if !json.Valid(head) {
+		return
+	}
+	_ = os.WriteFile(pj+".broken", b, 0o644)
+	_ = edit.WriteAtomic(pj, head)
 }
 
 // Dir is the folder magpie installs npm plugins into.
@@ -228,6 +260,7 @@ func save(l List) error {
 	if err := lastgood.Keep(listPath(), lastgood.JSON, 0o600); err != nil {
 		return err
 	}
+	defer filememo.Forget() // what follows plugins.json looks again (Written)
 	if err := writeWhole(listPath(), append(b, '\n')); err != nil {
 		return err
 	}
@@ -457,6 +490,7 @@ func add(ctx context.Context, spec, version string) (Entry, error) {
 	if err := save(l); err != nil {
 		return Entry{}, err
 	}
+	settleWaiting()
 	Restart()
 	return e, nil
 }
@@ -554,6 +588,7 @@ func Update(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("%s: %w", e.Spec, err))
 		}
 	}
+	settleWaiting()
 	Restart()
 	return errors.Join(errs...)
 }
@@ -713,12 +748,24 @@ func install(ctx context.Context, spec string) error {
 	installMu.Lock()
 	pj := filepath.Join(Dir(), "package.json")
 	if _, err := os.Stat(pj); err != nil {
-		if err := os.WriteFile(pj, []byte("{\n  \"name\": \"magpie-plugins\",\n  \"private\": true\n}\n"), 0o644); err != nil {
+		// through temp and rename, as every write of it: a write cut
+		// short would leave bun a package.json it can't read
+		if err := edit.WriteAtomic(pj, []byte("{\n  \"name\": \"magpie-plugins\",\n  \"private\": true\n}\n")); err != nil {
 			installMu.Unlock()
 			return err
 		}
 	}
 	defer installMu.Unlock()
+	mendPackageJSON()
+	defer mendPackageJSON()
+	// the clone bun resolves a git spec through may be stale, its refs
+	// still at the first install's: fetched here so a fresh resolve (an
+	// add after a remove, a plugin installed again for being missing)
+	// names the commit the remote is at now. Best-effort: a remote that
+	// can't be reached leaves the install to what the cache has, as
+	// before (#2954)
+	_ = refreshGitCache(ctx, spec)
+	mendDist(ctx, bun)
 	err = bunAdd(ctx, bun, spec)
 	// a @magpie-community package or version npm doesn't have (a new
 	// one waits for an owner to publish it there) comes from the
@@ -903,8 +950,9 @@ func ensurePi(ctx context.Context, target string) error {
 }
 
 // reinstall installs spec again: an npm one with bun add, a git one with
-// bun update, which fetches its branch's (or tag's) commit now where bun
-// add keeps the one bun.lock has.
+// bun update, which re-resolves its branch (or tag) where bun add keeps
+// the one bun.lock has — through bun's cache's clone of the repository,
+// whose refs refreshGitCache fetches first (#2954).
 func reinstall(ctx context.Context, spec string) error {
 	name := Name(spec)
 	if !IsGit(spec) || name == spec {
@@ -914,6 +962,14 @@ func reinstall(ctx context.Context, spec string) error {
 	if err != nil {
 		return err
 	}
+	// the update is to install what the repository is at now, which bun
+	// can only resolve through a clone whose refs are current: without
+	// the fetch it re-resolved the commit the lock already had and still
+	// said it had installed
+	if err := refreshGitCache(ctx, spec); err != nil {
+		return err
+	}
+	was := GitCommit(spec)
 	out, err := runBun(ctx, bun, "update", "--ignore-scripts", name)
 	if err != nil {
 		if hint := missingLibs(string(out)); hint != "" {
@@ -923,6 +979,23 @@ func reinstall(ctx context.Context, spec string) error {
 			return fmt.Errorf("bun update %s: %w", name, ue)
 		}
 		return fmt.Errorf("bun update %s: %v: %s", name, cantStart(bun, err), lastLines(string(out), 6))
+	}
+	// what the checks saw the repository at (the page's, before the
+	// reader pressed update) is what the update was to install: bun
+	// exiting 0 has meant the old commit stayed before, and the reader is
+	// to hear so rather than be told the update is done (#2954). One
+	// that moved has installed what bun resolved, newer than the answer
+	// when the repository moved on after it (#4802): it isn't told it
+	// stayed because the repository couldn't be asked again.
+	if head := GitHeadCached(spec); head != "" && GitBehind(spec, head) {
+		// the answer stood for a while: the repository may have moved on
+		// again since, so it is asked now before this is reported
+		if now, err := GitHead(ctx, spec, true); err == nil && now != "" {
+			head = now
+		}
+		if GitBehind(spec, head) && SameCommit(GitCommit(spec), was) {
+			return fmt.Errorf("bun update %s left it at %s, though its repository is at %s", name, short(GitCommit(spec)), short(head))
+		}
 	}
 	return nil
 }

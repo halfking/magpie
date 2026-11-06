@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/yetone/magpie/internal/settings"
 )
 
 // Note is one release's notes, as the app shows them after an update.
@@ -42,15 +44,24 @@ func ReleasePage(version string) string {
 // (none when "") up to and including upto, newest first, in lang (see
 // InLang).
 func NotesBetween(ctx context.Context, after, upto, lang string) ([]Note, error) {
+	notes, _, err := NotesBetweenTotal(ctx, after, upto, lang)
+	return notes, err
+}
+
+// NotesBetweenTotal is NotesBetween with how many releases there are in
+// all before MostNotes keeps the newest, so a list cut short can say so
+// (sujingshen on X: 156 releases behind read "40 releases").
+func NotesBetweenTotal(ctx context.Context, after, upto, lang string) ([]Note, int, error) {
 	q := url.Values{"upto": {upto}}
 	if after != "" {
 		q.Set("after", after)
 	}
 	notes, err := askNotes(ctx, q, lang)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return Between(notes, after, upto), nil
+	all := between(notes, after, upto)
+	return capNotes(all), len(all), nil
 }
 
 // BackCounts are the ranges Settings' What's new offers besides the notes
@@ -138,10 +149,61 @@ func withLang(feed, lang string) string {
 // often, and a long-unopened one would have pages of them.
 const MaxNotes = 40
 
+// StableMaxNotes is MaxNotes on the Stable channel, where an update is a
+// week of releases and its notes are read as one list (ssharpcc on X):
+// every one of them, as far as the site keeps them.
+const StableMaxNotes = 1500
+
+// MostNotes is how many releases' notes are shown at most on the channel
+// Settings name.
+func MostNotes() int {
+	if Stable() {
+		return StableMaxNotes
+	}
+	return MaxNotes
+}
+
+// Stable is whether Settings' Update channel is Stable: the update feed is
+// asked for a version a week, the newest that had been out three days as
+// the week began (Monday 00:00 UTC), or an urgent one (a security hole, a
+// ban risk, lost data) as soon as it is out. usemagpie.ai chooses it from
+// the release list (site/worker.js, "The Stable channel"); a release is
+// urgent when a line of its notes starts with "**Urgent release:**".
+func Stable() bool { return settings.Load().UpdateChannel == settings.UpdateStable }
+
+// withChannel is feed asking for Stable's release on the Stable channel,
+// and feed as it is on every version.
+func withChannel(feed string) string {
+	if !Stable() {
+		return feed
+	}
+	u, err := url.Parse(feed)
+	if err != nil {
+		return feed
+	}
+	q := u.Query()
+	q.Set("channel", settings.UpdateStable)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // Between keeps the notes of the releases after after up to and including
-// upto, newest first, at most MaxNotes; with after "" only upto's. Each
+// upto, newest first, at most MostNotes; with after "" only upto's. Each
 // one's Install section is taken out, and one left empty is dropped.
 func Between(notes []Note, after, upto string) []Note {
+	return capNotes(between(notes, after, upto))
+}
+
+// capNotes keeps the newest MostNotes of notes, newest first.
+func capNotes(notes []Note) []Note {
+	if most := MostNotes(); len(notes) > most {
+		return notes[:most]
+	}
+	return notes
+}
+
+// between is Between with every release kept.
+func between(notes []Note, after, upto string) []Note {
 	var out []Note
 	seen := map[string]bool{}
 	for _, n := range notes {
@@ -164,9 +226,6 @@ func Between(notes []Note, after, upto string) []Note {
 		out = append(out, n)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return Newer(out[i].Version, out[j].Version) })
-	if len(out) > MaxNotes {
-		out = out[:MaxNotes]
-	}
 	return out
 }
 

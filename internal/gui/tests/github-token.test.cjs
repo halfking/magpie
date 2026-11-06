@@ -74,6 +74,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       t.after(() => browser.close());
       const page = await (await browser.newContext({ viewport: { width: 1000, height: 900 } })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       const posted = [], st = { mask: "", from: "", env: false };
@@ -129,6 +130,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await ctx.addInitScript(() => { try { localStorage.setItem("magpie.libTab", "skills"); } catch {} });
       const page = await ctx.newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [];
       page.on("pageerror", (e) => errors.push(e.message));
       for (const st of [{ mask: "", from: "" }, { mask: "ghp_…0123", from: "settings" }]) {
@@ -137,7 +139,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await watchSettingsReads(page);
         await page.goto("http://magpie.test/?view=library");
         await settingsDrawn(page); // rows found are the ones that stay (#1659)
-        const check = page.locator("#view-library button.lib-updall", { hasText: w.check });
+        // Check for updates waits under the Skills heading's ⋯ (library-bar-more)
+        await page.locator("#view-library .lib-skillshead .lib-barmore").click();
+        const check = page.locator(".row-menu .rm-item.lib-check", { hasText: w.check });
         await check.waitFor();
         await check.click();
         await page.waitForFunction(() => document.querySelector("#view-library .lib-unchecked"));

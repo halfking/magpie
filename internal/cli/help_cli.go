@@ -60,10 +60,14 @@ func helpFor(args []string) string {
 		return cpuUsage
 	case "goroutines":
 		return goroutinesUsage
+	case "log", "logs":
+		return logUsage
 	case "sessions":
 		return sessionsUsage
 	case "search":
 		return searchUsage
+	case "tool", "tools":
+		return toolUsage
 	case "visible":
 		return visibleUsage
 	case "webdav", "dav":
@@ -74,6 +78,8 @@ func helpFor(args []string) string {
 		return githubUsage
 	case "claude-code":
 		return claudeCodeUsage
+	case "settings":
+		return settingsUsage
 	case "list":
 		cmd = "ls"
 	case "account":
@@ -125,6 +131,14 @@ func agentHelp(a *agent.Agent) string {
 	fmt.Fprintf(&b, "  magpie %s <field> <value>  set another field\n", id)
 	fmt.Fprintf(&b, "  magpie %s default          take magpie out: back on what it had before\n", id)
 	fmt.Fprintf(&b, "  magpie %s <field> default  that field back to its own default\n", id)
+	if a.ID == "agy" {
+		fmt.Fprintf(&b, "  magpie %s run [args…]      start agy, on magpie while its model is magpie's (what your shell's agy runs)\n", id)
+		fmt.Fprintf(&b, "  magpie %s env              the variables and model it is started with\n", id)
+	}
+	if a.ID == "claude" {
+		fmt.Fprintf(&b, "  magpie %s run [args…]      start Claude Code through magpie, a plain claude left as it is (what claude-magpie runs)\n", id)
+		fmt.Fprintf(&b, "  magpie %s launcher [add|remove]   the claude-magpie command\n", id)
+	}
 	var keys []string
 	for _, f := range a.Fields {
 		keys = append(keys, f.Key)

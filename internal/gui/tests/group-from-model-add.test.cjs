@@ -60,12 +60,12 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const open = async (posts, refuse) => {
           const page = await (await browser.newContext({ viewport: { width, height }, reducedMotion: "reduce" })).newPage();
           page.setDefaultTimeout(5000);
-          page.setDefaultNavigationTimeout(20000); // the page's first load, slow on a busy machine
+          page.setDefaultNavigationTimeout(60000); // the page's first load, slow on a busy machine
           const errors = [];
           page.on("pageerror", (e) => errors.push(e.message));
           await page.route("**/*", serve(lang, posts, refuse));
-          await page.goto(`http://magpie.test/?view=routing&newgroup=${encodeURIComponent(MODEL)}`);
-          const ed = page.locator("#view-routing:not([hidden]) .rt-gedit");
+          await page.goto(`http://magpie.test/?view=groups&newgroup=${encodeURIComponent(MODEL)}`);
+          const ed = page.locator("#view-groups:not([hidden]) .rt-gedit");
           await ed.waitFor();
           await ed.locator("input").first().fill("Hy4 preview");
           // the reader wheels down until Add itself is under the pointer's
@@ -93,7 +93,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
           const clickAdd = async () => {
             for (let i = 0; i < 80; i++) {
               const done = await page.evaluate(() => {
-                const v = document.querySelector("#view-routing");
+                const v = document.querySelector("#view-groups");
                 return v.scrollTop + v.clientHeight >= v.scrollHeight - 1;
               });
               if (done) break;

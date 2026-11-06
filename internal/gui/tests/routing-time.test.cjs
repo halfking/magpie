@@ -5,7 +5,8 @@
 // tells the rule that matched by them; in the editor the hours are two
 // times typed into one pill, past midnight noted, the days picked like the
 // agents, a time that isn't one marked, nothing moved by a click, and they
-// are saved as time:{from,to,days}. In English and Chinese.
+// are saved as time:{from,to,days}, with the browser's zone when typed.
+// In English and Chinese.
 const assert = require("node:assert/strict");
 const fs = require("node:fs/promises");
 const path = require("node:path");
@@ -75,19 +76,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
     test(`${engine} ${lang}: a rule for hours of the day`, async (t) => {
       const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
       t.after(() => browser.close());
-      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 } })).newPage();
+      const page = await (await browser.newContext({ viewport: { width: 1100, height: 1400 }, timezoneId: "Asia/Shanghai" })).newPage();
       page.setDefaultTimeout(5000);
+      page.setDefaultNavigationTimeout(60000);
       const errors = [], posts = [];
       page.on("pageerror", (e) => errors.push(e.message));
       await page.route("**/*", serve(lang, posts));
       await page.goto("http://magpie.test/?view=routing");
       const group = page.locator(".rt-group").first();
-      await group.waitFor();
+      await group.waitFor({ state: "attached" });
 
       // the trace: the rule that matched, told by its hours
       await page.waitForFunction((s) => document.documentElement.innerText.includes(s), w.cond);
       const said = await page.evaluate(() => document.documentElement.innerText);
       assert(said.includes(w.story), `the rule that matched is told: ${said.slice(0, 400)}`);
+      await page.evaluate(() => window.show("groups"));
+      await group.waitFor();
 
       // the group's rule, in words
       const title = await group.evaluate((g) => [...g.querySelectorAll("[title]")].map((e) => e.title).join("\n"));
@@ -109,7 +113,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // reader wheels Add a rule into view first: the editor runs past the
       // fold since the hints under Routing (a click's scroll is put back)
       const wheelTo = async (x) => {
-        const d = await x.evaluate((e) => { const v = document.querySelector("#view-routing");
+        const d = await x.evaluate((e) => { const v = document.querySelector("#view-groups");
           return Math.round(e.getBoundingClientRect().top - v.getBoundingClientRect().top - v.clientHeight / 2); });
         await page.mouse.move(550, 400);
         await page.mouse.wheel(0, d);
@@ -174,7 +178,7 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert(save, `saved: ${JSON.stringify(posts)}`);
       assert.deepEqual(save.body.rules.map((r) => [r.use, r.time]), [
         ["b/other", { from: "22:00", to: "08:00", days: WEEKDAYS }],
-        ["b/other", { from: "09:00", to: "18:00", days: [...WEEKDAYS, "sat"] }],
+        ["b/other", { from: "09:00", to: "18:00", days: [...WEEKDAYS, "sat"], zone: "Asia/Shanghai" }], // typed here: in this browser's zone
       ]);
       assert.deepEqual(errors, []);
     });

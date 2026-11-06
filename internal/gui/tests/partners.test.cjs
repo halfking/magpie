@@ -24,7 +24,7 @@ const partners = [
     regions: [
       { id: "cn", name: "China", chat: "https://api.acme.example.com/v1", website: "https://usemagpie.ai/go/acme/site/cn", siteHost: "cn.acme.example" },
       { id: "global", name: "Global", chat: "https://global.acme.example.com/v1", website: "https://usemagpie.ai/go/acme/site/global", siteHost: "global.acme.example" },
-    ] }),
+    ], splitAccounts: true }),
   partner("zhonly", "China Only", { langs: ["zh"], notes: { en: "Mainland relay", zh: "国内中转" } }),
   partner("taken", "Taken", { added: true }),
 ];
@@ -55,10 +55,10 @@ function server(lang, list, counted) {
 }
 
 const L = {
-  en: { head: ["Partners", "magpie's sponsors"], subs: "Subscriptions", rows: ["Acme AI", "Taken"], note: "Fast relay" },
-  zh: { head: ["合作伙伴", "赞助 magpie 的服务"], subs: "订阅", rows: ["Acme AI", "China Only", "Taken"], note: "快速中转" },
-  ja: { head: ["パートナー", "magpie のスポンサー"], subs: null, rows: ["Acme AI", "Taken"], note: "高速な中継" },
-  de: { head: ["Partner", "Sponsoren von magpie"], subs: null, rows: ["Acme AI", "Taken"], note: "Fast relay" },
+  en: { head: ["Partners", "magpie's sponsors"], subs: "Subscriptions", rows: ["Acme AI", "Taken"], note: "Fast relay", region: "pick the region of your Acme AI account" },
+  zh: { head: ["合作伙伴", "赞助 magpie 的服务"], subs: "订阅", rows: ["Acme AI", "China Only", "Taken"], note: "快速中转", region: "按你的 Acme AI 账号所在区域选择" },
+  ja: { head: ["パートナー", "magpie のスポンサー"], subs: null, rows: ["Acme AI", "Taken"], note: "高速な中継", region: "Acme AI アカウントのリージョンを選んでください" },
+  de: { head: ["Partner", "Sponsoren von magpie"], subs: null, rows: ["Acme AI", "Taken"], note: "Fast relay", region: "die Region deines Acme AI-Kontos wählen" },
 };
 
 async function openSheet(page) {
@@ -121,6 +121,9 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         // following the region picked
         const site = page.locator("#modal .editor .ehead .link.site");
         assert.equal(await site.textContent(), "cn.acme.example ↗");
+        // China's and Global's accounts don't cross (provider.SplitAccounts):
+        // the picker says to pick by the account
+        assert.equal(await page.locator("#modal .editor .segs.regions").locator("xpath=following-sibling::div[contains(@class,'hint')]").textContent(), w.region);
         await page.locator("#modal .editor .segs.regions .opt").nth(1).click();
         assert.equal(await site.textContent(), "global.acme.example ↗");
         assert.equal(await site.getAttribute("data-url"), "https://usemagpie.ai/go/acme/site/global");
@@ -170,11 +173,17 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         const dot = await add.evaluate((b) => { const s = getComputedStyle(b, "::after"); const r = b.getBoundingClientRect(); return { w: s.width, h: s.height, bg: s.backgroundColor, over: b.scrollWidth > b.clientWidth + 1, right: r.right <= innerWidth }; });
         assert.deepEqual([dot.w, dot.h, dot.over, dot.right], ["6px", "6px", false, true]);
         assert.notEqual(dot.bg, "rgba(0, 0, 0, 0)");
+        // Providers in the sidebar has the same news, a still dot
+        const nav = page.locator('#nav button[data-view="providers"]');
+        assert.equal(await nav.evaluate((b) => b.classList.contains("has-dot")), true);
+        assert.equal(await nav.getAttribute("title"), title);
 
         // the sheet shows them: no dot, then or after the page comes back
         await add.click();
         await page.locator("#addSheet .tile").first().waitFor();
         assert.equal(await add.evaluate((b) => b.classList.contains("has-new")), false);
+        assert.equal(await nav.evaluate((b) => b.classList.contains("has-dot")), false);
+        assert.equal(await nav.getAttribute("title"), null);
         // each new partner's tile has its own dot, inside the tile, and one
         // listed only in another language isn't there to have one
         const tileDots = () => page.locator("#addSheet .tile").evaluateAll((ts) => ts.filter((x) => x.querySelector(".new-dot")).map((x) => {
@@ -223,6 +232,45 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
         await page.context().close();
       });
     }
+    // the app opened on another page reads the list in the background and
+    // dots Providers in the sidebar from it: small, still, inside the row,
+    // in the accent; the page opened keeps it until the sheet shows them
+    // 1280 has the sidebar, 900 the header's tabs
+    for (const lang of ["en", "zh"]) for (const width of [1280, 900]) await t.test(`new partner dot in the nav ${lang} ${width}`, async () => {
+      const page = await (await browser.newContext({ viewport: { width, height: 800 } })).newPage();
+      const errors = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      const counted = [];
+      await page.route("**/*", server(lang, partners.map((p) => ({ ...p, new: true })), counted));
+      await page.goto("http://magpie.test/?view=agents");
+      const nav = page.locator('#nav button[data-view="providers"]');
+      await nav.waitFor();
+      await page.waitForFunction(() => document.querySelector('#nav button[data-view="providers"]').classList.contains("has-dot"));
+      assert.equal(await nav.getAttribute("title"), lang === "en" ? "New in Partners: Acme AI" : "合作伙伴有新成员：Acme AI, China Only");
+      const dot = await nav.evaluate((b) => {
+        const s = getComputedStyle(b, "::after"), r = b.getBoundingClientRect();
+        return { side: document.body.classList.contains("side-nav"), w: s.width, h: s.height, bg: s.backgroundColor, anim: s.animationName, inside: parseFloat(s.right) + parseFloat(s.width) <= r.width };
+      });
+      const px = width === 1280 ? "6px" : "5px";
+      assert.deepEqual([dot.side, dot.w, dot.h, dot.anim, dot.inside], [width === 1280, px, px, "none", true]);
+      assert.notEqual(dot.bg, "rgba(0, 0, 0, 0)");
+      await nav.click();
+      const add = page.locator("#addProvider");
+      await add.waitFor();
+      assert.equal(await nav.evaluate((b) => b.classList.contains("has-dot")), true);
+      await add.click();
+      await page.locator("#addSheet .tile").first().waitFor();
+      assert.equal(await nav.evaluate((b) => b.classList.contains("has-dot")), false);
+      await page.keyboard.press("Escape");
+      await page.locator("#addSheet").waitFor({ state: "hidden" });
+      // read again, the list says they were shown
+      await page.reload();
+      await nav.waitFor();
+      await page.waitForTimeout(300);
+      assert.equal(await nav.evaluate((b) => b.classList.contains("has-dot")), false);
+      assert.deepEqual(errors, []);
+      await page.context().close();
+    });
     await t.test("no partners, no heading", async () => {
       const page = await (await browser.newContext({ viewport: { width: 900, height: 800 } })).newPage();
       await page.route("**/*", server("en", []));

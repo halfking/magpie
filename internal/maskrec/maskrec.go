@@ -16,7 +16,9 @@ package maskrec
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/yetone/magpie/internal/appdir"
 )
 
@@ -37,12 +40,19 @@ const (
 	// keepSent is how many of the latest requests memory keeps whole, as
 	// the vendor got them, up to sentMax each: the 脱敏 page shows a
 	// request's text from it, its values put back from the masker's
-	// memory, and sentBudget in all
+	// memory, and sentBudget in all, as stored: zstd, since a request is
+	// JSON that repeats itself and a busy gateway held 64 MB of them
+	// (#2278). A screenshot's base64 hardly compresses, so the budget is
+	// half what it was whole.
 	keepSent   = 100
 	sentMax    = 4 << 20
-	sentBudget = 64 << 20
+	sentBudget = 32 << 20
 	dayForm    = "2006-01-02"
 )
+
+// SentMax is the longest request a record keeps as sent; a longer one is
+// kept as nothing, so a caller need not copy it.
+const SentMax = sentMax
 
 // Value is one value a request had masked, as often as it had it.
 type Value struct {
@@ -97,16 +107,33 @@ var store struct {
 	pruned time.Time
 	days   map[string]*dayAgg // a day's file → what it holds, as of its size
 	snips  []Record           // the latest records, with their snips
-	sent   []kept             // the records whose Sent memory keeps, oldest first
-	// sentBytes is their Sent in all
+	sent   []kept             // the latest records' Sent, oldest first
+	// sentBytes is their bodies in all, as stored
 	sentBytes int
+	// first is each placeholder by the key of the first record that had
+	// it, and firstRead whether the days on disk are in it (first.go)
+	first     map[string]int64
+	firstRead bool
 }
 
-// kept is a record whose Sent memory keeps, and its length.
+// kept is a record's Sent, zstd.
 type kept struct {
-	key int64
-	n   int
+	key  int64
+	body []byte
 }
+
+var (
+	sentEnc = sync.OnceValue(func() *zstd.Encoder {
+		e, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderCRC(false),
+			zstd.WithWindowSize(1<<20), zstd.WithEncoderConcurrency(2), zstd.WithLowerEncoderMem(true))
+		return e
+	})
+	sentDec = sync.OnceValue(func() *zstd.Decoder {
+		d, _ := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderMaxMemory(sentMax))
+		return d
+	})
+)
 
 // inTest says Add writes nothing: in a test binary testenv isolated, a
 // write still going as a test ends would put masking/ back into its
@@ -120,13 +147,32 @@ var ownTest = false
 // placeholder, counted. It returns r as recorded. Errors are swallowed:
 // keeping the record must never break a request.
 func Add(r Record) Record {
+	r, done := Hold(r)
+	done("", "")
+	return r
+}
+
+// Hold is Add for a request whose provider isn't known yet: a group's
+// member that fails passes it to the next, so the one it is planned for
+// may never get it (Max You and Linka on Discord: the records named the
+// group's first member, which no request had reached). r is in memory at
+// once, for its route's badge and the answer's Restored, and goes on disk,
+// where the summary counts it, once done is told the provider and model
+// that had it last ("" keeps r's). Only done's first call counts.
+func Hold(r Record) (Record, func(provider, model string)) {
 	if len(r.Values) == 0 && r.N == 0 {
-		return r
+		return r, func(string, string) {}
 	}
 	r.Values = merged(r.Values)
 	if r.Time.IsZero() {
 		r.Time = clock()
 	}
+	var body []byte
+	if r.Sent != "" && len(r.Sent) <= sentMax {
+		// the encoder may make room for all of Sent; keep what it wrote
+		body = bytes.Clone(sentEnc().EncodeAll([]byte(r.Sent), nil))
+	}
+	r.Sent = ""
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	r.Key = r.Time.UnixNano()
@@ -134,43 +180,52 @@ func Add(r Record) Record {
 		r.Key = store.last + 1
 	}
 	store.last = r.Key
-	if len(r.Sent) > sentMax {
-		r.Sent = ""
-	}
-	if r.Sent != "" {
-		store.sent = append(store.sent, kept{r.Key, len(r.Sent)})
-		store.sentBytes += len(r.Sent)
+	if body != nil {
+		store.sent = append(store.sent, kept{r.Key, body})
+		store.sentBytes += len(body)
 	}
 	for len(store.sent) > keepSent || store.sentBytes > sentBudget {
-		drop := store.sent[0]
+		store.sentBytes -= len(store.sent[0].body)
+		store.sent[0] = kept{}
 		store.sent = store.sent[1:]
-		store.sentBytes -= drop.n
-		if i := at(drop.key); i >= 0 {
-			store.snips[i].Sent = ""
-		}
 	}
 	store.snips = append(store.snips, r)
+	if store.first != nil {
+		noteFirst(store.first, r)
+	}
 	if len(store.snips) > keepSnips {
 		store.snips = append([]Record(nil), store.snips[len(store.snips)-keepSnips:]...)
 	}
-	r.Sent = ""
+	var once sync.Once
+	return r, func(provider, model string) { once.Do(func() { settle(r, provider, model) }) }
+}
+
+// settle gives r the provider and model that had it, in memory, and
+// writes it to its day.
+func settle(r Record, provider, model string) {
+	r.Provider, r.Model = cmp.Or(provider, r.Provider), cmp.Or(model, r.Model)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if i := at(r.Key); i >= 0 {
+		store.snips[i].Provider, store.snips[i].Model = r.Provider, r.Model
+	}
 	if inTest() {
-		return r
+		return
 	}
 	disk := r
 	disk.Snips, disk.Back = nil, nil
 	b, err := json.Marshal(disk)
 	if err != nil {
-		return r
+		return
 	}
 	dir := Dir()
 	if os.MkdirAll(dir, 0o700) != nil {
-		return r
+		return
 	}
 	path := filepath.Join(dir, r.Time.Local().Format(dayForm)+".jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return r
+		return
 	}
 	before, _ := f.Seek(0, 2)
 	_, err = f.Write(append(b, '\n'))
@@ -185,7 +240,28 @@ func Add(r Record) Record {
 		store.pruned = now
 		prune(dir, now)
 	}
-	return r
+}
+
+// Clear deletes every record kept: each day's file, and what memory has
+// of them (their snips, the requests' text). A day goes whole, never
+// rewritten, so nothing is left half-cleared for a reader; a request still
+// going is written to a new day's file once it is done. A day that can't
+// be removed stays, and is named in the error. What a placeholder stood
+// for is the masker's, in memory alone, and stays there for the answers
+// still to come.
+func Clear() error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var errs []error
+	for _, d := range files(Dir()) {
+		if err := os.Remove(d.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+			continue
+		}
+		delete(store.days, d.path)
+	}
+	store.snips, store.sent, store.sentBytes = nil, nil, 0
+	return errors.Join(errs...)
 }
 
 // merged is vs with one Value for each placeholder, its N the sum, in the
@@ -322,12 +398,23 @@ func Restored(key int64, put map[string]int) {
 // SentOf is the request of key as the vendor got it, while memory keeps
 // it.
 func SentOf(key int64) (string, bool) {
+	var body []byte
 	store.mu.Lock()
-	defer store.mu.Unlock()
-	if i := at(key); i >= 0 && store.snips[i].Sent != "" {
-		return store.snips[i].Sent, true
+	for _, k := range store.sent {
+		if k.key == key {
+			body = k.body
+			break
+		}
 	}
-	return "", false
+	store.mu.Unlock()
+	if body == nil {
+		return "", false
+	}
+	b, err := sentDec().DecodeAll(body, nil)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
 }
 
 // Filter narrows List: by kind (one, or several split by commas), by
@@ -374,6 +461,10 @@ func List(before int64, limit int, f Filter) ([]Record, bool) {
 				day = append(day, r)
 			}
 		})
+		// a record goes on disk once its request is done (Hold), so a
+		// long one comes after later ones: the list is in key order, as
+		// the next page's before needs
+		slices.SortStableFunc(day, func(a, b Record) int { return cmp.Compare(a.Key, b.Key) })
 		for j := len(day) - 1; j >= 0; j-- {
 			if len(out) == limit {
 				return out, true
@@ -401,9 +492,7 @@ func Get(key int64) (Record, bool) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if i := at(key); i >= 0 {
-		r := store.snips[i]
-		r.Sent = ""
-		return r, true
+		return store.snips[i], true
 	}
 	day := time.Unix(0, key).Local().Format(dayForm)
 	var got Record
