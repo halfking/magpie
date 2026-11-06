@@ -39,6 +39,11 @@ DEFAULT_MODELS = ["zcode/GLM-5.3-Flash", "zcode/GLM-5.3", "zcode/GLM-5.2",
                   "zcode/GLM-5-Turbo", "zcode/GLM-5.3-Flash-Trial"]
 DEFAULT_CONTEXT_WINDOW = 128000
 RECORD = []  # 测试证据行
+#2026-11-06 桶语义：trial（Start Plan 夜间桶）上游并发上限 3，与常规 serve
+#池不同，拆成独立凭据让网关按凭据限流——trial 满时 STD 不被连坐排队。
+TRIAL_RAW = "zcode/GLM-5.3-Flash-Trial"
+TRIAL_STD = "glm-5.3-flash-trial"
+TRIAL_CONCURRENCY = 3
 
 
 def log(msg):
@@ -265,44 +270,67 @@ def cmd_register(args):
         evidence("REGISTER_MODE", "create")
         evidence("PROVIDER_ID", pid)
 
-    # 2) credential（magpie caller key 即上游凭据）
+    #2) credentials 按桶拆分：serve（常规 GLM） plus trial（Start Plan桶，并发 3）
     creds = gw.credentials(pid)
-    cred = next((c for c in creds if (c.get("label") or "") == args.cred_label), None)
-    if cred:
-        cid = cred["id"]
-        log("credential exists: id=%s label=%s" % (cid, cred.get("label")))
-        evidence("CREDENTIAL_MODE", "existing")
-    else:
-        st, body = gw.api("POST", "/api/providers/%s/credentials" % pid,
-                          {"label": args.cred_label, "api_key": args.magpie_caller_key,
-                           "plan_type": "free"})
-        log("create credential: HTTP %s %s" % (st, json.dumps(body, ensure_ascii=False)[:160]))
-        if st not in (200, 201):
-            evidence("REGISTER_RESULT", "fail-cred-http%s" % st)
-            return 1
-        cid = body.get("id") or (body.get("credential") or {}).get("id")
-        evidence("CREDENTIAL_MODE", "create")
-    evidence("CREDENTIAL_ID", cid)
+    trial_models = [m for m in want if m == TRIAL_RAW]
+    std_models = [m for m in want if m != TRIAL_RAW]
 
-    # 3) 模型绑定（显式带 context_window，规避旧版 nil ContextWindow 42P08）
-    bound = gw.bindings(pid, cid)
-    bound_std = {b.get("standardized_name") or b.get("raw_model_name") for b in bound}
-    log("existing bindings: %s" % sorted(x for x in bound_std if x))
-    for m in want:
-        std = m.split("/")[-1].lower()
-        if std in bound_std:
-            log("binding exists: %s → %s" % (std, m))
-            continue
-        st, body = gw.api("POST", "/api/providers/%s/credentials/%s/models" % (pid, cid),
-                          {"raw_model_name": m, "standardized_name": std,
-                           "outbound_model_name": m, "available": True,
-                           "context_window": args.context_window})
-        log("bind %s → %s : HTTP %s %s" % (std, m, st, json.dumps(body, ensure_ascii=False)[:120]))
-    evidence("BINDINGS_AFTER", ",".join(sorted(x for x in gw.bindings(pid, cid) and {b.get("standardized_name") or b.get("raw_model_name") for b in gw.bindings(pid, cid)} if x)))
+    def ensure_cred(label, conc):
+        cred = next((c for c in creds if (c.get("label") or "") == label), None)
+        if cred:
+            cid = cred["id"]
+            log("credential exists: id=%s label=%s" % (cid, label))
+            evidence("CREDENTIAL_MODE_" + label.upper().replace("-", "_"), "existing")
+        else:
+            st, body = gw.api("POST", "/api/providers/%s/credentials" % pid,
+                    {"label": label, "api_key": args.magpie_caller_key,
+                    "plan_type": "free", "concurrency_limit": conc, "fp_slot_limit": conc})
+            log("create credential %s: HTTP %s %s" % (label, st, json.dumps(body, ensure_ascii=False)[:120]))
+            if st not in (200,201):
+                    evidence("REGISTER_RESULT", "fail-cred-http%s" % st)
+                    return None
+            cid = body.get("id") or (body.get("credential") or {}).get("id")
+            evidence("CREDENTIAL_MODE_" + label.upper().replace("-", "_"), "create")
+        return cid
+
+    cid = ensure_cred(args.cred_label, args.serve_concurrency)
+    trial_cid = ensure_cred("magpie-trial", TRIAL_CONCURRENCY) if trial_models else None
+    if cid is None and trial_cid is None:
+        return 1
+    if cid is not None:
+        evidence("CREDENTIAL_ID", cid)
+    if trial_cid is not None:
+        evidence("TRIAL_CREDENTIAL_ID", trial_cid)
+
+    #3) 模型绑定（显式带 context_window 规避旧版 nil ContextWindow42P08；
+    #500 时提示走 bind-via-ssh.sh SQL fallback）
+    def bind_models(target_cid, models):
+        if target_cid is None or not models:
+            return
+        bound = gw.bindings(pid, target_cid)
+        bound_std = {b.get("standardized_name") or b.get("raw_model_name") for b in bound}
+        log("existing bindings on %s: %s" % (target_cid, sorted(x for x in bound_std if x)))
+        for m in models:
+            std = m.split("/")[-1].lower()
+            if std in bound_std:
+                log("binding exists: %s to %s" % (std, m))
+                continue
+            st, body = gw.api("POST", "/api/providers/%s/credentials/%s/models" % (pid, target_cid),
+                    {"raw_model_name": m, "standardized_name": std,
+                    "outbound_model_name": m, "available": True,
+                    "context_window": args.context_window})
+            log("bind %s to %s : HTTP %s %s" % (std, m, st, json.dumps(body, ensure_ascii=False)[:120]))
+
+    bind_models(cid, std_models)
+    bind_models(trial_cid, trial_models)
+    all_live = set()
+    for target in (cid, trial_cid):
+        if target is not None:
+            all_live |= {b.get("standardized_name") or b.get("raw_model_name") for b in gw.bindings(pid, target)}
+    evidence("BINDINGS_AFTER", ",".join(sorted(x for x in all_live if x)))
 
     evidence("REGISTER_RESULT", "ok")
     return 0
-
 
 def urlparse_port(magpie_url):
     p = urllib.parse.urlparse(magpie_url)
@@ -431,6 +459,8 @@ def main():
     ap.add_argument("--max-tokens", type=int)
     ap.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW)
     ap.add_argument("--cred-label", default="magpie-serve")
+    ap.add_argument("--serve-concurrency", type=int, default=3,
+                       help="serve credential concurrency (trial fixed at3)")
     ap.add_argument("--probe-wait", type=int, default=20)
     args = ap.parse_args()
 

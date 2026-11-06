@@ -187,3 +187,33 @@ resolve：**trial rank1=99027/rank2=99030（唯一两候选）**；glm-5.3 rank1
 （5.6–48s），1 发 503 为排队超时（快速失败合理）。
 .36 的 zcode 5h 窗口耗尽（1308，18:54 重置）时网关自动全量
 回落 .30——均衡调度按"试遍候选"语义工作正常，窗口恢复后自然分担。
+
+##2026-11-06 第五轮：trial 桶独立并发（凭据拆分）
+
+约束明确：trial 桶（Start Plan）上游最大并发3，与各节点 serve池
+并发不同——凭据级并发不能一刀切。方案：每节点拆双凭据，网关按凭据
+独立限流，trial 满载不再连坐 STD 排队。
+
+**凭据拓扑（2026-11-0617:2x落位）**：
+|凭据 |节点 |绑定 | concurrency | fp_slot |
+|---|---|---|---|---|
+|99032 magpie-trial | .36 | 仅 trial |3|3|
+|99033 magpie-trial | .30 | 仅 trial |3|3|
+|99027 magpie-serve | .36 |4 个 STD GLM |6|3|（pool池 lane）
+|99030 magpie-serve | .30 |4 个 STD GLM |3|3|（单账号 lane）
+
+- serve 凭据的 trial 绑定禁用（
+`manual-moved-to-trial-credential` + admin_protected）；trial 凭据非
+trial 绑定禁用（discovery 给新凭据秒灌265 模型——narrow 269 行）。
+-99030 的 caller key 明文经 `POST .../credentials/{cid}/reveal`
+取出（audit log 留痕）用于创建 .30 的 trial 凭据。
+- resolve 验证：trial rank1/2=99032/99033（并发3 独立）；STD rank1=99030
+（.36 的 99027 因5h 窗口 suspended，18:54 重置自动恢复并发6）。
+-混合负载实测：2 trial +2 STD 并发——trial 0.2s 快速 503
+（白天无夜间配额），STD 双双 200 不受连坐；夜间窗口后 trial 真实出活
+且最多占3 槽，余量留给 STD。
+- register 脚本同步升级（
+`magpie_gateway_register.py`）：`magpie-trial` 凭据随注册自动创建
+（`TRIAL_CONCURRENCY=3`，`--serve-concurrency` 可调），模型绑定按桶分组；
+同一台机跑两节点注册时必须 `MAGPIE_REGISTER_HOSTNAME/IP --code`
+三件套覆盖身份（实测漏覆盖会把 95357 的 base_url 错改到本机，已修复）。
