@@ -399,3 +399,30 @@ Windows 适配与修复：
 `python scripts/gateway-register/magpie_gateway_register.py all --magpie
 http://127.0.0.1:3426`（LLM_GATEWAY_SECRET / LLM_GATEWAY_TEST_KEY /
 MAGPIE_CALLER_KEY 见 .deployment-validation 下 gitignored 文件）。
+
+##2026-11-07 第七轮：.19 节点正式安装 + 登录自启
+
+验证节点从 `.deployment-validation` 提升为**正式安装**（数据/注册态原样保留）：
+
+**安装布局**：`C:\Users\86133\AppData\Local\Programs\magpie\` —— `magpie.exe`
+（windowsgui 子系统构建，登录自启不弹控制台；版本 28750b102）+ `data\`
+（便携 data 整体迁入，`.portable` 随行）+ `magpie-cli.exe`（console 构建，
+终端管理用，同一 data）+ `webkey.txt` / `gateway-key-211-gateway.txt`。
+settings.json 补 `"port": 3426`（与 `lan:true` 一起让网关免 MAGPIE_ADDR 绑
+0.0.0.0:3426——`gateway.listenAddr()` 的行为）。
+
+**登录自启**（Windows 上 `magpie daemon install` 不支持，机制是 autostart）：
+- `magpie autostart on`（安装位 exe 执行）→ HKCU Run 值 `magpie` =
+  `"<exe>" tray`（登录进托盘、带网关；Task Manager 启动项可见可关）。
+- 管理页另建 HKCU Run 值 `magpie-web` = `"<exe>" web --addr 0.0.0.0:3446
+  --no-open`；web 密钥经 `setx MAGPIE_WEB_KEY`（用户环境变量，Run 键带不了
+  env；不设则每次随机、链接与 Maestro 的 MAGPIE_URL 都会漂）。
+- 网关先到先得：tray 与 web 两个进程同数据目录，谁先起谁服务网关，另一方
+  让位（web_cli 的 "another magpie has the gateway" 路径），行为已实测。
+
+**验证**（安装位）：0.0.0.0:3426+3446 监听 ✓；/v1/models 25 模型/5 zcode ✓；
+从 211 探测 200 ✓；**远程鉴权边界**：无鉴权/错 key 的 chat 从 211 打 → 401
+（本机 loopback 免鉴权是 magpie 设计——密钥管远程调用者）；网关 E2E → 200
+`INSTALLED-AUTOSTART-OK`（audit：provider=95464 credential=99035）✓；
+`magpie-cli autostart` → "opens at login, in the tray" ✓。
+下次登录起自动拉起；重启后无需人工介入。
