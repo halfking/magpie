@@ -266,5 +266,12 @@ func codexProxiedDetail(base, proxy, from string) string {
 	default:
 		d += "or add export NO_PROXY=127.0.0.1 to your shell profile (~/.zshrc): Codex in a terminal and the ChatGPT app's Codex both read it, "
 	}
+	// macOS' proxy settings name 127.0.0.1 in its bypass list, but Codex
+	// reads none of that list (reqwest's matcher); respect_system_proxy has
+	// Codex match it itself, which a loopback literal needs (a proxy that
+	// can't reach this machine's loopback answers every turn 502, 2026-11-06)
+	if !strings.Contains(strings.ToUpper(from), "_PROXY") {
+		d += "or set respect_system_proxy = true under [features] in Codex's config.toml, so it matches the system's bypass list itself (macOS' list is otherwise unread by it), "
+	}
 	return d + "then quit and reopen Codex. Until then, Disconnect from magpie puts Codex's config back as it was."
 }
