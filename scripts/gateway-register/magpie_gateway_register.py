@@ -41,30 +41,41 @@ DEFAULT_CONTEXT_WINDOW = 128000
 RECORD = []  # 测试证据行
 #2026-11-06 桶语义：trial（Start Plan 夜间桶）上游并发上限 3，与常规 serve
 #池不同，拆成独立凭据让网关按凭据限流——trial 满时 STD 不被连坐排队。
+#（trial 绑定的标准化名由 bind_models 按 raw 名小写取尾段得出。）
 TRIAL_RAW = "zcode/GLM-5.3-Flash-Trial"
-TRIAL_STD = "glm-5.3-flash-trial"
 TRIAL_CONCURRENCY = 3
+SECRETS = []  # 运行期收集的口令；log/evidence 输出前替换掉，key 不落终端/报告
+
+
+def scrub(msg):
+    for s in SECRETS:
+        if s:
+            msg = msg.replace(s, "[REDACTED]")
+    return msg
 
 
 def log(msg):
-    print(msg, flush=True)
+    print(scrub(msg), flush=True)
 
 
 def evidence(key, value):
     line = "VERIFY_%s=%s" % (key, value)
-    RECORD.append(line)
+    RECORD.append(scrub(line))
     log("[evidence] " + line)
 
 
 # ── 身份检测（跨平台）───────────────────────────────────────────────
-def detect_identity(gateway_host="llm.itestu.cn"):
+def detect_identity(gateway_url="https://llm.itestu.cn"):
     node = platform.node() or os.environ.get("COMPUTERNAME") or "unknown-host"
     host_override = os.environ.get("MAGPIE_REGISTER_HOSTNAME")  # 多平台测试时允许覆盖
     host = host_override or node
-    code = "magpie-" + host.lower().replace(".", "").replace(".local", "")[:40]
+    code = "magpie-" + host.lower().replace(".", "")[:40]
     ip = os.environ.get("MAGPIE_REGISTER_IP")
     if not ip:
-        ip = lan_ip(gateway_host, 443 if "https" else 8781) or "127.0.0.1"
+        u = urllib.parse.urlparse(gateway_url if "//" in gateway_url else "//" + gateway_url, scheme="https")
+        # UDP connect 只做路由探测，端口不参与结果；按网关 scheme 取对应端口
+        port = 443 if u.scheme == "https" else 8781
+        ip = lan_ip(u.hostname or gateway_url, port) or "127.0.0.1"
     return {
         "platform": "%s/%s" % (platform.system(), platform.machine()),
         "python": platform.python_version(),
@@ -105,8 +116,17 @@ def http_json(method, url, body=None, headers=None, timeout=30):
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, method=method, data=data, headers=hdrs)
+    # clash verge 这类系统代理：shell 里有 http_proxy 时 urllib 会把 127.0.0.1 的
+    # 请求也交给代理，而代理回不到本机回环 → 502/超时（本机 magpie :3426 打不通
+    # 的典型原因）。回环目标一律直连。
+    host = (urllib.parse.urlparse(url).hostname or "")
+    opener = None
+    if host in ("localhost", "::1") or host.startswith("127."):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        r = (opener.open(req, timeout=timeout) if opener
+             else urllib.request.urlopen(req, timeout=timeout))
+        with r:
             raw = r.read().decode()
             return r.status, (json.loads(raw) if raw.strip() else {})
     except urllib.error.HTTPError as e:
@@ -207,7 +227,7 @@ def read_quotas(config_dir):
 
 # ── register ──────────────────────────────────────────────────────
 def cmd_register(args):
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    ident = detect_identity(args.gateway)
     evidence("PLATFORM", ident["platform"])
     evidence("HOSTNAME", ident["hostname"])
     evidence("LAN_IP", ident["ip"])
@@ -224,9 +244,18 @@ def cmd_register(args):
     want = unique or ([] if not models else DEFAULT_MODELS)
     if not want:
         log("magpie serves no models (HTTP %s, %d ids) — registering with no bindings" % (mst, len(models)))
-        evidence("BIND_MODELS", "none")
     log("magpie models: %d total, bind candidates: %s" % (len(models), want))
-    evidence("BIND_MODELS", ",".join(want))
+    evidence("BIND_MODELS", ",".join(want) or "none")
+
+    # 回环守卫：检测不到 LAN IP 时回落了 127.0.0.1，拿它当 base_url 注册会让
+    # 网关打到它自己（幂等路径更会把一个好好指向 RFC1918 的 base_url PATCH 坏，
+    # 同 2026-11-06 第五轮"漏覆盖身份错改 95357"一类事故）。真要回环就用
+    # MAGPIE_REGISTER_IP=127.0.0.1 显式声明。
+    if ident["ip"].startswith("127."):
+        log("LAN IP 检测失败（回落 %s）——拒绝以回环地址注册/收敛 base_url。"
+            "用 MAGPIE_REGISTER_IP 显式指定本机对网关可达的地址后重跑。" % ident["ip"])
+        evidence("REGISTER_RESULT", "fail-loopback-ip")
+        return 1
 
     gw = Gateway(args.gateway, args.secret)
 
@@ -297,6 +326,9 @@ def cmd_register(args):
     trial_cid = ensure_cred("magpie-trial", TRIAL_CONCURRENCY) if trial_models else None
     if cid is None and trial_cid is None:
         return 1
+    # 有凭据创建失败时继续把能绑的绑完（work 尽量做），但结论记 partial、退出非 0，
+    # 不再让末尾的 REGISTER_RESULT=ok 把 fail-cred 证据行盖掉
+    cred_failed = cid is None or (trial_models and trial_cid is None)
     if cid is not None:
         evidence("CREDENTIAL_ID", cid)
     if trial_cid is not None:
@@ -329,6 +361,10 @@ def cmd_register(args):
             all_live |= {b.get("standardized_name") or b.get("raw_model_name") for b in gw.bindings(pid, target)}
     evidence("BINDINGS_AFTER", ",".join(sorted(x for x in all_live if x)))
 
+    if cred_failed:
+        log("部分凭据创建失败（见上方 fail-cred 证据行）——REGISTER_RESULT 记 partial")
+        evidence("REGISTER_RESULT", "partial")
+        return 1
     evidence("REGISTER_RESULT", "ok")
     return 0
 
@@ -363,7 +399,7 @@ def cmd_e2e(args):
 
 def cmd_quota(args):
     """余量同步: magpie quotas.json → PATCH provider notes.quota_snapshot。"""
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    ident = detect_identity(args.gateway)
     q = read_quotas(args.magpie_config_dir)
     if q is None:
         log("quotas.json 不存在于 %s（用 --magpie-config-dir 指定 magpie 配置目录）" % args.magpie_config_dir)
@@ -378,7 +414,7 @@ def cmd_quota(args):
                 log("  %s | %s: %s" % (acc, w["name"], w.get("display", "%s / %s" % (w.get("used"), w["limit"]))))
     gw = Gateway(args.gateway, args.secret)
     code = args.code or ident["code"]
-    p = gw.find_by_code(code) or (gw.find_by_code("magpie-zcode") if gw.find_by_code("magpie-zcode") else None)
+    p = gw.find_by_code(code) or gw.find_by_code("magpie-zcode")
     if not p:
         log("provider 未注册（先跑 register）")
         evidence("QUOTA_SYNC", "no-provider")
@@ -398,7 +434,7 @@ def cmd_quota(args):
 def cmd_usage(args):
     """网关侧用量（请求经网关即自动记账）。"""
     gw = Gateway(args.gateway, args.secret)
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    ident = detect_identity(args.gateway)
     code = args.code or ident["code"]
     p = gw.find_by_code(code)
     if not p:
@@ -417,7 +453,7 @@ def cmd_models(args):
     mst, models = magpie_models(args.magpie, args.magpie_caller_key)
     log("magpie HTTP %s, %d models" % (mst, len(models)))
     gw = Gateway(args.gateway, args.secret)
-    ident = detect_identity(urllib.parse.urlparse(args.gateway).hostname or "")
+    ident = detect_identity(args.gateway)
     p = gw.find_by_code(args.code or ident["code"])
     if p:
         for c in gw.credentials(p["id"]):
@@ -460,17 +496,21 @@ def main():
     ap.add_argument("--context-window", type=int, default=DEFAULT_CONTEXT_WINDOW)
     ap.add_argument("--cred-label", default="magpie-serve")
     ap.add_argument("--serve-concurrency", type=int, default=3,
-                       help="serve credential concurrency (trial fixed at3)")
+                       help="serve credential concurrency (trial 固定 3)")
     ap.add_argument("--probe-wait", type=int, default=20)
     args = ap.parse_args()
 
+    SECRETS.extend(v for v in (args.secret, args.test_key, args.magpie_caller_key) if v)
+
     if args.cmd == "identify":
-        log(json.dumps(detect_identity(urllib.parse.urlparse(args.gateway).hostname or ""), ensure_ascii=False))
+        log(json.dumps(detect_identity(args.gateway), ensure_ascii=False))
         return 0
     if not args.magpie_caller_key and args.cmd in ("register", "models", "all"):
         raise SystemExit("缺少 --magpie-caller-key / MAGPIE_CALLER_KEY")
     if not args.secret and args.cmd in ("register", "quota", "usage", "models", "all"):
         raise SystemExit("缺少 --secret / LLM_GATEWAY_SECRET")
+    if not args.test_key and args.cmd in ("e2e", "all"):
+        raise SystemExit("缺少 --test-key / LLM_GATEWAY_TEST_KEY")
     fn = {"models": cmd_models, "register": cmd_register, "e2e": cmd_e2e,
           "quota": cmd_quota, "usage": cmd_usage, "all": cmd_all}[args.cmd]
     return fn(args)
