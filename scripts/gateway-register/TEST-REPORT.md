@@ -288,7 +288,8 @@ usage 200/200（provider_name 已是
 registration=auto、magpie_port=3425。
 
 **Maestro**：5 flow 全绿（m1/m2/m3 + g1/g2），报告
-`tests/maestro/reports/20261107-005906/`。
+`tests/maestro/reports/20261107-005906/`；最终 head（801b258a，Go 树与部署
+二进制完全一致，diff 为空）上复跑再绿一轮：`reports/20261107-010540/`。
 
 **本轮新建网关数据面 key**：id 230 `magpie-round6-e2e`（app e2e-magpie-test）
 ——key 列表不回显既有值，沿用往轮建一次性 key 的做法（229 `magpie-e2e-test`
