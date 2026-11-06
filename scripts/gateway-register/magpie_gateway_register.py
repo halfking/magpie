@@ -214,9 +214,12 @@ def cmd_register(args):
     evidence("MAGPIE_MODELS_HTTP", mst)
     evidence("MAGPIE_MODELS_COUNT", len(models))
     unique = [m for m in models if m.startswith("zcode/")]
-    if args.models:
+    if args.models is not None:
         unique = [m for m in args.models.split(",") if m]
-    want = unique or DEFAULT_MODELS
+    want = unique or ([] if not models else DEFAULT_MODELS)
+    if not want:
+        log("magpie serves no models (HTTP %s, %d ids) — registering with no bindings" % (mst, len(models)))
+        evidence("BIND_MODELS", "none")
     log("magpie models: %d total, bind candidates: %s" % (len(models), want))
     evidence("BIND_MODELS", ",".join(want))
 
