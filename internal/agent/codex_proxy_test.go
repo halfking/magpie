@@ -369,6 +369,27 @@ func TestCodexProxiedDriftShowsNoCredentials(t *testing.T) {
 	}
 }
 
+// 2026-11-06: no env names a proxy, so Codex's default reqwest takes the
+// system's "Web proxy (HTTP)" entry and reads none of its bypass list — a
+// list holding 127.0.0.1 kept nothing off it, and a proxy that can't reach
+// this machine's loopback answered every turn 502. The detail then names
+// respect_system_proxy, the one switch that has Codex match the system's
+// bypass list itself, beside the NO_PROXY export it always said.
+func TestCodexProxiedDetailSaysRespectSystemProxy(t *testing.T) {
+	fakeReach(t, map[string]bool{gateway.URL(): true})
+	home, _ := codexAt(t, gateway.URL())
+	works := false
+	clash := "http://127.0.0.1:7890"
+	proxyAs(t, map[string]string{}, netproxy.Proxy{URL: clash, HTTP: clash, Bypass: []string{"127.0.0.1"}}, "darwin", &works)
+	d := driftSettled(t, codex(home))
+	if d == nil || d.Kind != "proxied" {
+		t.Fatalf("drift %+v", d)
+	}
+	if !strings.Contains(d.Detail, "the system's proxy settings") || !strings.Contains(d.Detail, "respect_system_proxy") {
+		t.Fatalf("detail: %s", d.Detail)
+	}
+}
+
 // Leon920717 on X: with magpie quit, Codex CLI kept retrying the gateway
 // till magpie was open again. The failover base URL magpie wrote goes as
 // the magpie serving the gateway quits (EndCodexFailover), and the next
