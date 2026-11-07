@@ -571,4 +571,34 @@ ZCode IDE 本体（当前最大消耗源）、llm.itestu.cn 公开模型 `glm-5.
    （avail=1），若再次复发需查网关 auto-recovery 对守卫的绕过。
    复验：第三方 `/v1/models?scope=all` 列全 GLM 家族（809 模型，trial 在列）；
    trial E2E 200（40.3s，audit provider=95464 credential=99035）。
->>>>>>> 91bd6c70c (docs: round eight — Start Plan perception verified to the bucket, quota sync runs hourly)
+
+##2026-11-07 第九轮：glm-5.3-flash ≡ trial 别名统一（免费优先 + 自动回落，调用方零感知）
+
+需求：调用方一律请求 `glm-5.3-flash`；系统优先走 Start Plan 免费桶（trial），
+并发管好；trial 超额/失效自动落标准 glm-5.3-flash 通道，智能体不中断、不改模型名。
+
+**实现（网关配置，无代码）**：三个 trial 凭据（99032/99033/99035）上既有的
+discovery 行 `zcode/GLM-5.3-Flash` 改造为别名绑定——`available=t`、
+`outbound_model_name='zcode/GLM-5.3-Flash-Trial'`（magpie 插件把 -Trial 路由到
+gift 桶）、`priority=TRUE`、`manual_priority=1/2/3`、`admin_protected=f`（保持
+discovery 可见）；glm-5.3-flash 的其余候选整体后移：NIM 8/18→4/5、endless
+19→6、serve 99027/99030→7/8（其 outbound 已被并行会话指到 -Trial 别名）。
+只动 glm-5.3-flash 的绑定行，其他模型不受影响。
+
+**验证**：
+- resolve 顺序：trial 1/2/3 → NIM 4/5 → endless 6 → serve 7/8 ✓
+- 第三方 E2E model=glm-5.3-flash → 200 `TRIAL-FIRST-OK`（2.7s）；
+  audit/upstream 日志：credential=99033（trial lane）、热表
+  raw_model_name=`zcode/GLM-5.3-Flash-Trial`（别名出站生效）✓
+- 免费桶实烧：balance remaining 422.18M → 396.42M（~70min，本 IDE 会话 +
+  生产用户经新通道；生产流式大请求 is_stream=true 持续 200）✓
+- 并发：trial 车道各 concurrency 3（饱和即被规划器跳过，落 NIM）；候选失败
+  转移为网关既有语义（第四/五轮实测）✓
+- 超额回落：trial 桶耗尽/计划过期时 magpie 对 -Trial 出站报错 → 候选失败 →
+  NIM/serve 顶上（STD 周桶 11-11 17:16 恢复后 serve 深层兜底）✓（语义按
+  第四轮实测；未真实耗尽 500M 桶做破坏性验证）
+
+**风险记录**：别名绑定行是 discovery 建的、admin_protected=f——discovery 周期
+可能重置其 available（重排 priority/outbound 的风险低，未观察到）；若复发，
+重跑本节 UPDATE 即可。trial 车道现在承担 glm-5.3-flash 主流量，其 3 并发饱和时
+自动溢出到 NIM——免费桶消耗速率因此可视话务量显著加快，属预期。
