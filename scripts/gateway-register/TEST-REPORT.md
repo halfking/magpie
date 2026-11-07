@@ -620,15 +620,28 @@ magpie 内部对 3008 的耐心重试；非 trial 池闲置）。教训：manual
 1×503（150.7s，`no_candidates`）。无 429 透传；但极端并发（叠加实时 IDE 流量
 竞争同一账号并发）下出现 503 尾部。
 
-**移交 llm-gateway-go 的两个精确现象**（本仓不修）：
-1. `glm-5.3-flash-trial` 503：resolve 列 6 个候选（99032/99033/99027/99030/
-   99034/99035），执行阶段 `tried: 1, kind: transient` 后即终止——失败后未
-   续走剩余候选；同车道别名模型 `glm-5.3-flash` 同期 200（1.8s），出站名相同，
-   差异只在 client_model → 疑在 dispatch 的候选挑选/重试预算与
-   `All N candidates failed` 的终止条件（failover.go retryBudget/
-   terminateOnAttemptCap 一带）。api_keys 无模型白名单列，已排除 key 作用域。
-2. 热表 `usage_ledger_hot` 的 credential 归属记 resolve-top 而非实际服务凭据
-   （第八轮已记）——按凭据做车道分析必须用容器 audit 日志。
+**第十轮勘误（活实例与真根因，替代上面两条"移交"猜测）**：
+- **活网关是 `llm-gateway-211-a`**（-b 已 Exited 137 十小时，本轮前段所有
+  日志归因查的是死容器的陈旧日志——docker ps 要看全量）。
+- `-trial` 503 的真根因：**URSM v2 内存视图把 trial 候选判 `avail=false`**
+  （节点探针在"账号并发被各自 IDE 会话占满"的机器上耗尽——.19 的占用者就是
+  本会话），与 DB available=t 相悖；resolve 候选数随之塌缩 6→1→0
+  （`URSM v2 authoritative view filtered out every candidate`）。
+- **修复**：`PATCH /api/routing/emergency-repair` 带 `raw_model` 的
+  force_enable 是**按 (凭据,模型) 的精准工具**（cmb_rows_updated=1、
+  ursm_cleared=true，无全量翻转污染）——对 99035/99032/99033 各执行一次后
+  候选恢复尝试（tried 0→5）。
+- **行为验证（用户诉求成立）**：99035 返回 429 → 网关
+  `kind=concurrent action=switch_node` 自动换节点 → 99033/99032
+  （circuit_open 则继续）→ 全部 trial 车道饱和时 503 是正确终态（该模型名
+  只有免费桶）；同期**别名模型 `glm-5.3-flash` 3/3 × 200**，流量落到标准池
+  （provider 32/credential 62 等）——trial 优先、并发超限自动落非 trial、
+  调用方零感知，全链路成立。
+- **真移交项（缩水后）**：① URSM v2 视图对"非网关流量占用的账号并发"悲观
+  （探针失败即 avail=false，不看 magpie 排队能否最终服务）——按模型 scoped
+  force_enable 可手动修复，网关侧若让探针识别 magpie 的排队-最终成功语义
+  （或视图衰减更快）可自愈；② `llm-gateway-211-b` 容器 Exited 137 待运维查看
+  （OOM？）；③ 热表归属记 resolve-top（第八轮已记，车道分析用 audit 日志）。
 
 **状态**：burst 后 8 个相关凭据 circuit 全部 closed、0 连败、ready（自愈）；
 别名路径（用户主诉求）经 FINAL-FLASH-OK 200 复验；`-trial` 独立模型名在
