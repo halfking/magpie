@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,7 +61,18 @@ func TestDesktopSessionAccountMetadata(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", filepath.Join(home, "AppData", "Local"))
 	t.Setenv("CODEX_HOME", filepath.Join(home, ".codex"))
 	root := sessions.DesktopDataDirs()[0]
-	root3p := sessions.DesktopDataDirs()[1]
+	// Windows' dirs run Data, Mode and ThreeP (index 1 is Mode, not 3p);
+	// the third-party root is the one whose name carries -3p everywhere.
+	root3p := ""
+	for _, d := range sessions.DesktopDataDirs() {
+		if strings.Contains(filepath.Base(d), "-3p") {
+			root3p = d
+			break
+		}
+	}
+	if root3p == "" {
+		t.Fatal("no Claude-3p root among the desktop data dirs")
+	}
 	account, org := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
 	write := func(path, text string) {
 		t.Helper()

@@ -508,7 +508,9 @@ func reopenBundle(ctx context.Context, a *Agent, bundle, exe string) error {
 	if err := appQuit(ctx, bundle); err != nil {
 		return restartErr(noticeRestartAsk, a)
 	}
-	pat := regexp.QuoteMeta(bundle + "/Contents/")
+	// the finder names the executable with filepath.Join, whose separators
+	// are the platform's; ask for the bundle's subtree the same way
+	pat := regexp.QuoteMeta(filepath.Join(bundle, "Contents") + string(filepath.Separator))
 	end := time.Now().Add(appQuitWait)
 	for len(appProcs(running(pat), exe)) > 0 {
 		if time.Now().After(end) {

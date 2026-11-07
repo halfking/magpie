@@ -3,6 +3,7 @@ package update
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -74,6 +75,9 @@ func TestPackagedByPacmanOtherName(t *testing.T) {
 // dpkg lists absolute paths, and on a merged /usr may list /bin for the
 // /usr/bin the binary resolves to.
 func TestPackagedByDpkg(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("dpkg's multiarch .list name holds a colon, which NTFS reads as a stream separator, not a file name")
+	}
 	root := t.TempDir()
 	info := filepath.Join(root, "var/lib/dpkg/info")
 	writeFile(t, filepath.Join(info, "coreutils.list"), "/.\n/bin\n/bin/ls\n")

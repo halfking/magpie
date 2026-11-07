@@ -32,6 +32,11 @@ func TestAsideInitialReadOffersStageWithoutWrites(t *testing.T) {
 }
 
 func TestAsideOfflineDisconnectRestoresWithoutDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// an agent whose desktop app reads its folder is never taken for
+		// gone there (#2300), so no fixture can be "the CLI is missing"
+		t.Skip("on Windows dsh's desktop app makes cliHeld unable to tell")
+	}
 	settings, models := asideHome(t)
 	before := readFile(settings)
 	a := mustFindAside(t)

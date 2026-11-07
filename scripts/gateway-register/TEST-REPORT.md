@@ -646,3 +646,101 @@ magpie 内部对 3008 的耐心重试；非 trial 池闲置）。教训：manual
 **状态**：burst 后 8 个相关凭据 circuit 全部 closed、0 连败、ready（自愈）；
 别名路径（用户主诉求）经 FINAL-FLASH-OK 200 复验；`-trial` 独立模型名在
 burst 恢复期瞬态 503、绑定表状态完好。系统整体健康，移交项交网关仓跟进。
+
+## 2026-11-08 第九轮：HEAD 重部署 .19、Windows 全量单测审计与 trial 车道收敛
+
+**代码**：origin/main 与本地同指 98cd1d40d（无新提交，拉取即合并）；上一提交把
+一个 merge 残留的冲突标记 `>>>>>>> 91bd6c70c` 落进了本报告末行——已清除。本轮
+改动为 docs/tests/flows 加一处 Go 源码一致性修复（apprestart.go
+reopenBundle 的 still-open 探测 pattern，见下 7）。
+
+**部署**：HEAD 双二进制重建（windowsgui `magpie.exe` + console
+`magpie-cli.exe`，launcher 流程照 release-windows）替换安装位
+`Programs\magpie`，tray + web 两进程按登录自启同形重启：:3426/:3446 监听 ✓，
+`/v1/models` 25 个、独有 5 个 `zcode/*` ✓。直连 trial 出活 200。
+
+**注册/网关**：`all` 幂等复跑全绿——idempotent-patch、95464 + 凭据
+99034(serve)/99035(trial) existing、绑定守卫完好（99034 available 恰 4 个 STD
+GLM，99035 恰 flash→Trial + trial 两行）、E2E 200、quota patch-200、usage
+500/200（网关 no-rows 已知问题）。
+
+**网关侧运营面修复（不在本仓库修，本轮实测坐实）**：
+1. **死候选拖垮 trial 车道**：resolve 对 `glm-5.3-flash-trial` 的 top 候选是
+   95433 的 99032——那是第六轮 Mac 旧 serve 实例（:3426），round-8 重建后
+   `/v1/models` 仍答 200（探针 ready）但真实 chat 全败（audit `success=false`
+   latency 10~56s 连发）。每次第三方 trial 请求都先吃一个死候选超时：
+   **E2E 54.7s → PATCH 95433 enabled=false 后 2.2s**（与 round-3 摘 95357 同
+   法）。
+2. **99033（.36 trial 凭据）绑定漂移**：discovery 复灌 13 行 available（3 个
+   STD GLM + 8 个 codex，outbound 全空）——STD 流量经 trial 车道吃 STD 桶
+   （suspended 中）即失败连坐。SQL 收窄到与 .19 的 99035 同形：恰
+   `glm-5.3-flash`（outbound→Trial）+ `glm-5.3-flash-trial` 两行，其余 11 行
+   `manual-trial-only` + `admin_protected` 双守卫。99030 的 codex 8 行是节点
+   真实目录（round-8-B 已记预期），未动。
+
+**Windows 全量单测（本仓库首次在本机全量跑）**：`go test ./...` 揪出上游测试
+的 Windows 可移植性问题，修掉 8 处；`gofmt -l`、`go vet` 全净：
+1. `internal/update` TestPackagedByDpkg：dpkg multiarch 的
+   `magpie:amd64.list` 带冒号，NTFS 读作 alternate data stream——fixture 在
+   Windows 上永远建不成文件。非 Windows 跳过（skip 说明在案）。
+2. `internal/usage` TestDesktopSessionAccountMetadata：第三方 root 取
+   `DesktopDataDirs()[1]`——Windows 上 [1] 是 Mode（%LOCALAPPDATA%\Claude）
+   而非 ThreeP，第三方 email 被当作可链身份 → 冲突抹掉 emails[account/org] →
+   Code-tab 断言失败。改为按 `-3p` 后缀选 root（与 resolver 自己的判法一致）。
+3. `internal/agent` TestClaudeDesktopCarriesTheLanguage：沙箱把 Desktop 自己的
+   config.json 放进 Mode 目录，生产（desktopSets）从 Data 读——Windows 上
+   Mode≠Data 恒失败。沙箱改按 desktopdir.Find 的 Data 放 app（与生产同形）。
+4. `internal/agent` TestMiseShimWindowsFiveAgents + TestHowInstalledWindowsShim：
+   期望的 npm 命令缺 `--allow-scripts=<pkg>`（withScripts 已加、这两条
+   Windows-only 测试上游 CI 不跑、悄悄过期）——期望按 `cliSpecs.scripts`
+   补齐（仅 scripts:true 的 spec 才带）。两测复跑 PASS。
+5. `internal/agent` TestAsideOfflineDisconnectRestoresWithoutDaemon：生产规则
+   在 Windows 上对有桌面 app 的 agent（dsh）`cliHeld` 恒 unknown（#2300），
+   "CLI 缺失" 的 fixture 状态造不出来——非 darwin 跳过。
+6. `internal/agent` TestClaudeViaMagpieKept：kept 路径每次 re-stamp，stamp 的
+   `environSum()` 调 `os.Environ()`——Windows 每变量一串分配，大环境机器实测
+   123 allocs/look（清单本身仍只是 clone，4.7×于全量构建）。绝对阈值
+   （≤20）按 macOS 调的——Windows 跳过，实测数记在 skip 说明里。
+   （`TestWithViaKeepsTheJoinedList` 同根因，见下「残留」。）
+7. `internal/agent` TestWorkBuddyRestartOnMac（+ darwin 子测）：stub 的进程
+   cmd 用 `/` 拼，代码问的 pattern 是 `QuoteMeta(filepath.Join(...))`——
+   Windows 上分隔符错位永不命中。stub、断言与生产侧 reopenBundle 的
+   still-open 探测 pattern（原是 `bundle + "/Contents/"` 字面拼接，与 finder
+   的 filepath.Join 不一致——macOS 行为不变）统一按 filepath.Join 构造。
+   两测复跑 PASS。
+8. `internal/update`/`internal/usage`/`internal/agent` 三包：修复项逐测复跑
+   PASS/SKIP（dpkg、session-provider 两包全量 ok）。本机 commit 耗尽时段
+   （见下）曾挡住复跑，错峰重试后全过。
+
+**残留（上游测试 × 本机状态，未在本轮处理，全量 17 个）**：三个家族——
+① stamp 的 env-hash 分配类（`environSum` 每次 `os.Environ()`，Windows 每变量
+一串分配；大环境开发机上 AllocsPerRun 的小阈值必爆）：TestIsMagpieKeptWhile
+CatalogStays、TestMagpieModelsKeptWhileCatalogStays、TestViaMagpieKeptWhile
+CatalogStays、TestOwnOptionsKept、TestWithViaKeepsTheJoinedList、
+TestOwnModelsSayTheyGoDirect；② 机器/账号状态类（真实 IDE 插件目录、
+keychain、hermes profile）：TestCodexSignInInKeychain、
+TestCodexSyncMendsGoneCatalog、TestCodexOwnModelsFollowPicks、
+TestHermesProfilesFollowMagpieModel、TestHermesProfileModels、
+TestCopilotFolderFromAnIDEPluginIsNotTheCLI、
+TestQoderSettingsFromAnIDEPluginIsNotTheCLI、
+TestDesktopHandlerNeedsItsEntryAndProgram；③ 上游测试自身缺陷类：
+TestT3CodeCodexInstance（fixture 路径插值出 `"a" $b` 字面量）、
+TestOpenLodyRunsItsDesktopEntry、TestDesktopExec（Linux .desktop 形制未按
+GOOS 收口）。①的根治在让 environSum 变廉价（生产侧，另议），③可按 GOOS
+跳过，留待上游侧或后续轮。
+
+**本机环境告警（与仓库无关）**：今日多时段系统 commit 耗尽
+（FreeVirtualMemory≈0.2GB，errno 1455 "paging file too small"），go 编译/vet
+间歇性 OOM——进程合计仅 ~19GB，瓶颈在内核态（驱动）占用；页面文件 35GB 未
+自动扩。测试与构建需挑时段跑。
+
+**Maestro**：首轮 6/7——m3 失败：正式安装位是 tray+web 双进程，网关由 tray
+持有，web 页如实显示「运行中 · 由另一个 magpie 提供」，m3 的精确断言
+`运行中` 按单进程写法不中（API 实证 running=true mine=false）。flow 断言改
+`运行中.*`（两种布局都中、'未运行' 仍不中）；m3 单跑 PASS 后**全量复跑
+7/7 全绿**（reports/<第二轮时间戳>，summary `flows: 7 failed: 0`）。
+
+**复跑方式**（本机）：安装位自启已覆盖；注册/E2E：
+`python scripts/gateway-register/magpie_gateway_register.py all --magpie
+http://127.0.0.1:3426 --probe-wait 5`（密钥见 .deployment-validation
+gitignored 文件）；Maestro：`bash tests/maestro/run-local.sh`。

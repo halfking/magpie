@@ -29,6 +29,12 @@ func desktopSandbox(t *testing.T) (string, desktopPaths) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
 	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
+	// Desktop's own config.json sits in Data's folder (desktopSets puts
+	// app there): on Windows Mode is %LOCALAPPDATA%\Claude, Data is
+	// %APPDATA%\Claude, and only the latter is Desktop's signed-in userData.
+	if d := desktopdir.Find(runtime.GOOS, home, os.Getenv); d.Data != p.dir {
+		p.app = filepath.Join(d.Data, "config.json")
+	}
 	return home, p
 }
 

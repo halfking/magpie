@@ -8,8 +8,10 @@ url: ${MAGPIE_URL}
     timeout: 30000
 - tapOn: '网关'
 - extendedWaitUntil:
-    # 页首状态是「网关」+ 子节点「运行中」两个文本节点（IAB 快照里才合成一个）
-    visible: '运行中'
+    # 页首状态是「网关」+ 子节点「运行中」两个文本节点（IAB 快照里才合成一个）。
+    # 正式安装位是 tray+web 双进程：网关由 tray 持有，web 页如实显示
+    # 「运行中 · 由另一个 magpie 提供」——.* 让单进程（'运行中'）与双进程都中。
+    visible: '运行中.*'
     timeout: 20000
 - extendedWaitUntil:
     # 为本测试实例建的共享密钥名
