@@ -647,7 +647,10 @@ magpie 内部对 3008 的耐心重试；非 trial 池闲置）。教训：manual
 别名路径（用户主诉求）经 FINAL-FLASH-OK 200 复验；`-trial` 独立模型名在
 burst 恢复期瞬态 503、绑定表状态完好。系统整体健康，移交项交网关仓跟进。
 
-## 2026-11-08 第九轮：HEAD 重部署 .19、Windows 全量单测审计与 trial 车道收敛
+## 2026-11-08 第十一轮：HEAD 重部署 .19、Windows 全量单测审计与 trial 车道收敛
+
+（编号勘误：落提交时序为第九轮、并行会话的 11-07 两节已占第九/十轮——本节顺延
+第十一轮；提交标题里的 "round nine" 以本节编号为准。）
 
 **代码**：origin/main 与本地同指 98cd1d40d（无新提交，拉取即合并）；上一提交把
 一个 merge 残留的冲突标记 `>>>>>>> 91bd6c70c` 落进了本报告末行——已清除。本轮
@@ -677,6 +680,13 @@ GLM，99035 恰 flash→Trial + trial 两行）、E2E 200、quota patch-200、us
    `glm-5.3-flash`（outbound→Trial）+ `glm-5.3-flash-trial` 两行，其余 11 行
    `manual-trial-only` + `admin_protected` 双守卫。99030 的 codex 8 行是节点
    真实目录（round-8-B 已记预期），未动。
+3. **与并行会话第九/十轮（别名车道、URSM 勘误）的交互**：其别名行
+   （99032/99033/99035 的 `zcode/GLM-5.3-Flash`→`-Trial` outbound、
+   manual_priority 1）在本轮收窄后原样保留（99033 恰为收窄后两行之一），
+   别名主车道不受影响；其 resolve 表里的 99032（trial rank1）/99027（serve
+   rank7）都属 95433 的死实例，本轮 enabled=false 一并摘除——实测只是把
+   54.7s 的首候选超时拿掉，别名车道的 99033/99035 rank 未变。其"别名行
+   admin_protected=f，discovery 可能重置"的风险记录仍在案。
 
 **Windows 全量单测（本仓库首次在本机全量跑）**：`go test ./...` 揪出上游测试
 的 Windows 可移植性问题，修掉 8 处；`gofmt -l`、`go vet` 全净：
