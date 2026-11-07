@@ -602,3 +602,34 @@ discovery 可见）；glm-5.3-flash 的其余候选整体后移：NIM 8/18→4/5
 可能重置其 available（重排 priority/outbound 的风险低，未观察到）；若复发，
 重跑本节 UPDATE 即可。trial 车道现在承担 glm-5.3-flash 主流量，其 3 并发饱和时
 自动溢出到 NIM——免费桶消耗速率因此可视话务量显著加快，属预期。
+
+##2026-11-07 第十轮：trial 并发超限的溢出实测与移交项
+
+需求：trial 池并发超限（429/排队）时自动把请求送到非 trial 池，任务不中断。
+
+**实测一（12 路并发，等优先级前）**：12/12 全部 200、零 429/503 透传——但全部
+黏在 manual_priority 最优的 99032 一条车道，其中 2 路 189s/192s（.36 节点
+magpie 内部对 3008 的耐心重试；非 trial 池闲置）。教训：manual_priority 严格
+排序 = 单道堆积，均摊要用**等优先级**（与第四轮均衡语义一致）。
+
+**修正**：三条 trial 车道的 glm-5.3-flash 别名行 manual_priority 统一为 1；
+99035 上被 discovery 复活的 4 行重复绑定去重（只留别名行，重复行
+`manual-trial-alias-dup`+admin_protected 双守卫）。
+
+**实测二（修正后 12 路并发）**：10×200（2.5-22s），1×502（46s，nginx 层），
+1×503（150.7s，`no_candidates`）。无 429 透传；但极端并发（叠加实时 IDE 流量
+竞争同一账号并发）下出现 503 尾部。
+
+**移交 llm-gateway-go 的两个精确现象**（本仓不修）：
+1. `glm-5.3-flash-trial` 503：resolve 列 6 个候选（99032/99033/99027/99030/
+   99034/99035），执行阶段 `tried: 1, kind: transient` 后即终止——失败后未
+   续走剩余候选；同车道别名模型 `glm-5.3-flash` 同期 200（1.8s），出站名相同，
+   差异只在 client_model → 疑在 dispatch 的候选挑选/重试预算与
+   `All N candidates failed` 的终止条件（failover.go retryBudget/
+   terminateOnAttemptCap 一带）。api_keys 无模型白名单列，已排除 key 作用域。
+2. 热表 `usage_ledger_hot` 的 credential 归属记 resolve-top 而非实际服务凭据
+   （第八轮已记）——按凭据做车道分析必须用容器 audit 日志。
+
+**状态**：burst 后 8 个相关凭据 circuit 全部 closed、0 连败、ready（自愈）；
+别名路径（用户主诉求）经 FINAL-FLASH-OK 200 复验；`-trial` 独立模型名在
+burst 恢复期瞬态 503、绑定表状态完好。系统整体健康，移交项交网关仓跟进。
