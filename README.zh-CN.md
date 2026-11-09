@@ -293,6 +293,7 @@ magpie plugin options model-map '{"mapping": {"fast": "deepseek/deepseek-chat"}}
 | **[导入链接](https://usemagpie.ai/docs/zh/import)** | 给 provider 网站用的「添加到 magpie」按钮 |
 | **[远程 magpie](https://usemagpie.ai/docs/zh/remote)** | 在其他电脑上用同一个 magpie 的 provider 和路由组 |
 | **[Docker](https://usemagpie.ai/docs/zh/docker)** | 在服务器或 NAS 上运行 magpie |
+| **本 fork 自有工具** | [scripts/gateway-register/](scripts/gateway-register/) — 把本机 magpie 注册为 LLM Gateway 供应商并同步模型、余量与用量；[tests/maestro/](tests/maestro/) — Maestro 用例与本地运行方式 |
 
 ## 隐私
 

@@ -3335,6 +3335,7 @@ gateway translates.
 ```sh
 magpie                          # open the app: a window plus the menu bar icon
 magpie tray                     # menu bar icon only (use this in your login items)
+magpie panel                    # the menu bar icon's quick panel on its own, or closed again
 magpie tui                      # the same thing, in the terminal; serves the gateway while open when no other magpie does
 magpie web                      # the app's window in a browser (WSL, a server over SSH); --lan, --addr, --no-open, --gateway, --tls-cert/--tls-key
                                 # (a new key each run; MAGPIE_WEB_KEY keeps one, for a page run as a service)
@@ -3342,7 +3343,13 @@ magpie web                      # the app's window in a browser (WSL, a server o
 magpie serve                    # the gateway alone, no window; --web[=host:port] serves the page too, from the same process
                                 # --tls-cert <file> --tls-key <file>: https:// for other computers (see HTTPS under sharing)
 magpie daemon install           # run magpie serve as a service (systemd, launchd); --web, --lan, --addr serve the page too; --tls-cert/--tls-key, --no-tls
+magpie uninstall [--yes]        # disconnect every agent, put back what each had, then remove magpie's service and files
+                                # --keep-data: all but magpie's settings, providers and usage
+magpie claude-code [install [--yes]|remove]
+                                # the Claude Code a Claude subscription runs; install fetches Anthropic's own build,
+                                # checked against its manifest, for a server or container without one
 magpie ls                       # list every agent and its current settings
+magpie agents                   # list every supported agent
 magpie claude opus              # set a model (agent names accept prefixes: cc, oc, gem …)
 magpie codex gpt-5.6-sol
 magpie codex effort high        # other fields
@@ -3360,9 +3367,12 @@ magpie mimo anthropic/claude-sonnet-5
 magpie save work                # snapshot everything as a profile
 magpie use work                 # switch back
 magpie profiles
+magpie rename work work2        # rename a profile
 magpie rm work
 
 magpie sync                     # refresh the models.dev catalog and every live model list
+magpie library [sync|instructions|mcp|skill]
+                                # the instructions, MCP servers and skills written into every agent (magpie library help)
 
 magpie settings                 # every setting the window's Settings saves, its value and default (--json too)
 magpie settings get usageAlert
@@ -3373,9 +3383,24 @@ magpie settings reset theme     # back to its default
 magpie quota                    # what is left of every subscription, plan and key balance
 magpie quota refresh codex      # read Codex's cards again now (once per 30s)
 magpie quota wait codex         # block until a Codex account has allowance again
+magpie quota history [<provider|account>] [--days N] [--json]
+                                # each window's readings over time, kept 45 days
 magpie quota credits me@example.com off   # hold a ChatGPT account at its limit instead of spending credits
 magpie quota credits me@example.com last  # spend its credits only after every other account, key and fallback
 magpie quota credits me@example.com first # spend its credits before moving to another account
+
+magpie sessions [--days N|today|all] [--model <m>] [--folder <f>] [--json]
+                                # the latest Claude Code, Codex, OpenCode and Pi sessions, with what each cost
+magpie sessions read [on|off all|<agent>…]
+                                # which agents' session history magpie may read (none until allowed)
+
+magpie gateway-key access <id> [read-only|full]
+                                # read-only: the key reads quotas and usage (GET /, /v1/magpie/quotas,
+                                # /v1/magpie/usage) and uses no model, MCP server or write
+magpie gateway-key move <id> <place>   # put a key at a place in the list (from 1), the order list and the app show them in
+
+magpie mcp image                # the image and video generation MCP server an agent is given from the library (stdio)
+magpie licenses                 # the third-party notices of what magpie is built with
 
 magpie tools                    # the tools magpie's MCP servers give agents, with their parameters
 magpie tools generate_image     # one tool in full
