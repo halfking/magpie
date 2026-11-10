@@ -224,6 +224,10 @@ type Record struct {
 	// what ImageFilesSaved was saved on (matrix0487 on Discord). None in a
 	// row from before it was kept.
 	ImageFiles int `json:"image_files,omitempty"`
+	// Socket says the request went over the Responses WebSocket, its
+	// last try (provider.Socket, matrix0487 on Discord): UpBytes is then
+	// what the socket was sent, a delta on a kept socket.
+	Socket bool `json:"ws,omitempty"`
 	// Kind is what the agent made the call for when it isn't a turn of
 	// the conversation: a Codex subagent's (review, compact, guardian…)
 	Kind string `json:"kind,omitempty"`
@@ -256,6 +260,13 @@ type Record struct {
 	// has the request's attempts already, so it can pass the row over.
 	// Never persisted.
 	Watched bool `json:"-"`
+	// ClientIP is the address the request came to the gateway from, as the
+	// connection gave it (the gateway trusts no forwarding header, so behind
+	// a proxy it is the proxy's): a loopback address for this computer. It
+	// stays on this computer: sync (SharedCalls) and the gateway's
+	// /v1/magpie/usage/requests leave it out. "" for a row kept before it
+	// was recorded, a call a client reported, or magpie's own.
+	ClientIP string `json:"client_ip,omitempty"`
 	// Local is true only for verified loopback gateway requests. It is used
 	// for local-session deduplication, never persisted or exported.
 	Local bool `json:"-"`
@@ -540,10 +551,13 @@ func (r Record) CostAt(p catalog.Price) float64 {
 type Totals struct {
 	// Calls are the requests, Errors those the agent got an error for, and
 	// Retried those answered after a try that failed first (Record.Tries):
-	// a try handed on is in neither count, but its tokens are in the sums
-	Calls   int `json:"calls"`
-	Errors  int `json:"errors"`
-	Retried int `json:"retried,omitempty"`
+	// a try handed on is in neither count, but its tokens are in the sums.
+	// Canceled are those the agent canceled before they were answered
+	// (Record.Canceled): neither an error nor answered
+	Calls    int `json:"calls"`
+	Errors   int `json:"errors"`
+	Retried  int `json:"retried,omitempty"`
+	Canceled int `json:"canceled,omitempty"`
 	// Loops are those of Errors magpie ended for looping (LoopErrType):
 	// a model's count of them says how often it got stuck (#1858)
 	Loops      int `json:"loops,omitempty"`
@@ -845,7 +859,7 @@ func (t *Totals) addFrom(row Row, price *catalog.Price) {
 	t.countCache(r)
 	t.Reasoning += r.Reasoning
 	t.addBytes(&r)
-	if r.TTFT > 0 && !r.Failed() {
+	if r.TTFT > 0 && r.Answered() {
 		t.Timed++
 		t.TTFT += r.TTFT
 		if n, w := row.Decode(); w > 0 {
@@ -869,8 +883,9 @@ func (t *Totals) addFrom(row Row, price *catalog.Price) {
 // their errors.
 const LoopErrType = "reply_loop"
 
-// count counts r as the request it ends: failed, answered on a retry, or
-// answered; a try handed on to another is no request of its own.
+// count counts r as the request it ends: failed, canceled by its agent,
+// answered on a retry, or answered; a try handed on to another is no
+// request of its own.
 func (t *Totals) count(r Record) {
 	// a try handed on is billed its credits too, though it is no request
 	if r.Credits != nil {
@@ -882,6 +897,8 @@ func (t *Totals) count(r Record) {
 	}
 	t.Calls++
 	switch {
+	case r.Canceled():
+		t.Canceled++
 	case r.Failed():
 		t.Errors++
 		if r.ErrType == LoopErrType {
@@ -897,8 +914,8 @@ func (t *Totals) count(r Record) {
 func (r Record) LostRequest() bool { return r.Failed() && !r.HandedOn }
 
 // RetriedRequest is whether r ends a request that was answered after a try
-// that failed first.
-func (r Record) RetriedRequest() bool { return !r.HandedOn && !r.Failed() && r.Tries > 1 }
+// that failed first (not one its agent canceled after a failed try).
+func (r Record) RetriedRequest() bool { return !r.HandedOn && r.Answered() && r.Tries > 1 }
 
 // Group is the share of one agent or model.
 type Group struct {

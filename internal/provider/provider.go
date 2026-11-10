@@ -18,7 +18,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +28,8 @@ import (
 	"github.com/yetone/magpie/internal/catalog"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/lastgood"
+	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
 )
@@ -141,6 +142,16 @@ type Provider struct {
 	// ends. Off, the default, it keeps its place. Not for "rotate", which
 	// goes round already. See gateway.sink.
 	Sink bool `json:"sink,omitempty"`
+
+	// UseFirst puts its keys or accounts ahead of the other providers'
+	// where Smart weighs them together: a group of several providers'
+	// models (hzh_1119 on Discord: an OpenAI API key's monthly credit
+	// spent before the ChatGPT subscription serving the same models). One
+	// resting after a failure, out of credit or out of quota (a 429
+	// insufficient_quota) is passed over as ever, and one all but used up
+	// goes with the others that are. Off, the default, Smart goes as it
+	// always has (routes.Seat.Lead).
+	UseFirst bool `json:"useFirst,omitempty"`
 
 	// Affinity is how long a conversation stays with the key or account
 	// that answered it, so the vendor's prompt cache it filled is read
@@ -349,6 +360,18 @@ type Provider struct {
 	// the top-level tools even where magpie's default would send the item.
 	AdditionalToolsOff bool `json:"additionalToolsOff,omitempty"`
 
+	// PassErrors, `errors=pass`, is the user's word that the client, not
+	// magpie, deals with what the provider's errors say (ne9ko9 on
+	// Discord): a request to it is asked once, its error goes to the
+	// agent as it came (its status, and its body as written where the
+	// agent's API is the provider's own, else in the agent's shape with
+	// the vendor's type, code and words), nothing about it is inferred
+	// (a prompt too long, a busy relay), it is not asked again in place
+	// or of a fallback or a group's next member, and none of its keys
+	// rests for it. Off, the default, magpie handles them. Only a provider
+	// of a key takes it (TakesPassErrors).
+	PassErrors bool `json:"passErrors,omitempty"`
+
 	// Patience is how many seconds more a request to this provider alone,
 	// not through a group, may be kept once it has failed in a way that
 	// passes (overloaded, unavailable, rate limited for a moment) and the
@@ -358,6 +381,16 @@ type Provider struct {
 	// `magpie provider set <id> patience=`; a group it is in keeps the
 	// group's own.
 	Patience int `json:"patience,omitempty"`
+
+	// Socket has a Responses API provider's turns go over the Responses
+	// WebSocket magpie speaks to chatgpt.com (#5781, matrix0487 on
+	// Discord): SocketAuto tries it and falls back to HTTP, and leaves the
+	// host to HTTP for a while once it refuses the handshake, as
+	// chatgpt.com is; SocketOn tries it every time and falls back without
+	// that. "", the default, is HTTP alone. Only a provider of a key with a
+	// Responses URL takes it (TakesSocket). Set with `magpie provider set
+	// <id> socket=`.
+	Socket string `json:"socket,omitempty"`
 
 	// NativeCompaction has Codex's compaction_trigger go to the provider
 	// as Codex sent it, and the compaction the provider writes back go to
@@ -371,21 +404,26 @@ type Provider struct {
 	// keeps magpie's summary.
 	NativeCompaction bool `json:"nativeCompaction,omitempty"`
 
-	// PassUserAgent has a request go to the vendor with the User-Agent the
-	// agent that sent it gave (pi, opencode, Claude Code…), in place of
-	// magpie's own (#1851): a coding plan that serves only agents it names
-	// knows them by it. One the agent didn't give, or magpie's own
-	// requests, go as magpie. Off, the default, every request goes as
-	// magpie. Only a key+URL provider takes it: a signed-in account, a
-	// plugin's and one that goes as a client of its vendor's own keep the
-	// identity their signing gives (see PassesUserAgent).
-	PassUserAgent bool `json:"passUserAgent,omitempty"`
+	// MagpieUserAgent has every request go to the vendor with magpie's own
+	// User-Agent (magpie/<version>). Off, the default, a key+URL provider is
+	// sent the User-Agent the agent gave (pi, opencode, Claude Code…) as it
+	// gave it (#1851, nb5p on Discord): a coding plan that serves only
+	// agents it names, or the user's own gateway behind magpie, knows them
+	// by it. One the agent didn't give, and magpie's own requests, go as
+	// magpie either way. A signed-in account, a plugin's and one that goes
+	// as a client of its vendor's own keep the identity their signing
+	// gives (see PassesUserAgent). The opt-in "passUserAgent" it replaces
+	// is the default now, so a file that still says it reads the same.
+	MagpieUserAgent bool `json:"magpieUserAgent,omitempty"`
 
 	// PinUpstream, on the Cline API, has its DeepSeek models answered only
 	// by DeepSeek's own API (White Immortal on Discord) and its GLM models
 	// only by Z.ai's (sdytman on Discord): Cline routes a model through an
 	// AI gateway that may serve it from any host, and the maker's own
-	// keeps its prompt cache. See ClinePin.
+	// keeps its prompt cache. Since 2026-11-06 Cline refuses the
+	// providerOptions field that pinned all but glm-5.3-flash, so only
+	// that model is pinned now (#5442); the saved value is kept as set.
+	// See ClinePin.
 	PinUpstream bool `json:"pinUpstream,omitempty"`
 
 	// AuthHeader is which header the key goes in on a third-party
@@ -424,6 +462,19 @@ type Provider struct {
 	// (UncheckedHosts); see Via.
 	HTTP1 bool `json:"http1,omitempty"`
 
+	// ClientCert and ClientKey are the PEM files of a client certificate
+	// magpie shows the provider's own HTTPS hosts when they ask for one,
+	// and ServerCA a PEM CA their certificate may be signed by beside the
+	// system's roots (#5596, clxsh, and hhdaxia on X: Remote magpie to a
+	// magpie at home behind an Nginx that requires a client certificate,
+	// or one with `magpie mtls` on). Only a provider the user added, and
+	// Remote magpie, takes them (TakesClientCert), for the hosts of its
+	// own base URLs (UncheckedHosts), on every request made for it:
+	// models, the connection test, requests, quotas; see Via.
+	ClientCert string `json:"clientCert,omitempty"`
+	ClientKey  string `json:"clientKey,omitempty"`
+	ServerCA   string `json:"serverCA,omitempty"`
+
 	// Proxy is the proxy magpie's requests to this provider go through
 	// (#237: Codex through one, a vendor at home without): "" follows
 	// the global one (Settings' Proxy, the environment's, the system's),
@@ -457,6 +508,12 @@ type Provider struct {
 	// and then the window's WindowCapID: 1–99, or 100 for none on it. A
 	// window not in it takes the account's AccountCaps.
 	AccountWindowCaps map[string]map[string]int `json:"accountWindowCaps,omitempty"`
+	// AccountWindowAmounts is, for a subscription, the fixed amount of a
+	// window's own unit (credits, requests, tokens) an account is used to
+	// at most where the user set one in place of a share (9won_25273 on
+	// Discord), by account and window as AccountWindowCaps. A window has
+	// one or the other.
+	AccountWindowAmounts map[string]map[string]float64 `json:"accountWindowAmounts,omitempty"`
 	// CapStop, for a subscription whose accounts are capped, ends there
 	// (plugins#349): while every account is held at its cap, a request is
 	// answered 429, as the vendor would, rather than sent on to Fallback.
@@ -479,6 +536,11 @@ type Provider struct {
 	// a day, a month or in all, by its KeyID: past it, routing takes the
 	// key for used up until the period renews (see key_spend.go).
 	KeySpendCaps map[string]SpendCap `json:"keySpendCaps,omitempty"`
+	// KeyOwnBalances is, for a provider of API keys whose vendor tells no
+	// balance, what the user typed is left on each key, by its KeyID: the
+	// key's card shows it less what magpie priced its calls at since
+	// (see key_balance_own.go).
+	KeyOwnBalances map[string]OwnBalance `json:"keyOwnBalances,omitempty"`
 
 	// BalanceURL, when set, is where the vendor tells what is left on a
 	// key, asked with the key the way a chat request carries it; BalancePath
@@ -510,6 +572,14 @@ type Provider struct {
 	// that lists them away from the base URL requests go to (Xiaomi MiMo's
 	// plans are served at their own hosts, the list at api.xiaomimimo.com).
 	ModelsURL string `json:"modelsURL,omitempty"`
+	// ListOff is the editor's Fetch the model list unticked (axelburks on
+	// Discord): the vendor's list is never asked for, by a Fetch, a
+	// Refresh, a test or a schedule, and the models served are the ids the
+	// user added alone, not models.dev's nor a list fetched before. For a
+	// vendor whose list names models by ids that can't be asked for
+	// (Volcengine Ark's, where each is asked by an endpoint id the user
+	// made). A key's provider only (ListsOff).
+	ListOff bool `json:"listOff,omitempty"`
 
 	// Models the user chose to expose. Empty means "the preset's picks, or
 	// everything the vendor lists when that list is short" — unless NoModels.
@@ -564,13 +634,13 @@ type Provider struct {
 	Unlisted bool `json:"unlisted,omitempty"`
 	// HiddenDrawers are the provider's image models the user unticked in
 	// its editor (321sssrt on X: an OpenAI key lists a dozen): left out of
-	// every list one is picked from (Settings › Images, another magpie's
+	// every list one is picked from (Settings › Models › Images, another magpie's
 	// list, Aside's) and of Automatic's choice, as an unticked chat model
 	// is left out of the agents' lists. A deny list beside Models, not in
 	// it: Models is what agents chat with, empty meaning the vendor's list,
 	// so an image model put there would be offered to chat with, and
 	// hiding one would mean picking every chat model. A request that names
-	// one still draws with it, and so does the one Settings › Images
+	// one still draws with it, and so does the one Settings › Models › Images
 	// names: a hidden pick is shown as picked, and said to be hidden.
 	HiddenDrawers []string `json:"hiddenDrawers,omitempty"`
 	// HiddenVideomakers are its video models unticked in its editor, as
@@ -704,7 +774,12 @@ func (e *unreadableError) Unwrap() []error { return []error{ErrUnreadable, e.err
 
 // Reads used for an edit must keep errors: a broken file is not an empty
 // catalog to write over. Only a missing file is a first use.
+// fileReads counts read, for the test that a page's look at whether the
+// file parses doesn't parse it again.
+var fileReads atomic.Int64
+
 func read() (file, error) {
+	fileReads.Add(1)
 	var f file
 	b, err := steady.ReadFile(Path())
 	if errors.Is(err, os.ErrNotExist) {
@@ -742,6 +817,11 @@ var utf8BOM = []byte("\xef\xbb\xbf")
 // FileError is why providers.json can't be read, nil when it can or isn't
 // there: for what lists the providers to say so, not "none yet".
 func FileError() error {
+	// a file that parses, parsed once until it changes (storedFile): each
+	// Providers page parsed the whole of it again only to see it does
+	if _, err := filememo.Read("providers", Path(), parseProviders); err == nil {
+		return nil
+	}
 	_, err := read()
 	return err
 }
@@ -857,12 +937,20 @@ func (p Provider) clone() Provider {
 	p.AccountCaps = maps.Clone(p.AccountCaps)
 	p.AccountNames = maps.Clone(p.AccountNames)
 	p.KeySpendCaps = maps.Clone(p.KeySpendCaps)
+	p.KeyOwnBalances = maps.Clone(p.KeyOwnBalances)
 	if p.AccountWindowCaps != nil {
 		m := make(map[string]map[string]int, len(p.AccountWindowCaps))
 		for k, v := range p.AccountWindowCaps {
 			m[k] = maps.Clone(v)
 		}
 		p.AccountWindowCaps = m
+	}
+	if p.AccountWindowAmounts != nil {
+		m := make(map[string]map[string]float64, len(p.AccountWindowAmounts))
+		for k, v := range p.AccountWindowAmounts {
+			m[k] = maps.Clone(v)
+		}
+		p.AccountWindowAmounts = m
 	}
 	p.AccountConcurrency = maps.Clone(p.AccountConcurrency)
 	p.AccountWeights = maps.Clone(p.AccountWeights)
@@ -970,8 +1058,9 @@ func accountSettings(a, pk Provider) Provider {
 	// plugin's provider too (isee1_1 on Discord)
 	a.Unredacted = pk.Unredacted
 	a.Proxy, a.AccountProxies, a.AccountModels, a.AccountModelsAll = pk.Proxy, pk.AccountProxies, pk.AccountModels, pk.AccountModelsAll
-	a.AccountCaps, a.AccountWindowCaps = pk.AccountCaps, pk.AccountWindowCaps
+	a.AccountCaps, a.AccountWindowCaps, a.AccountWindowAmounts = pk.AccountCaps, pk.AccountWindowCaps, pk.AccountWindowAmounts
 	a.CapStop, a.CapCareful = pk.CapStop, pk.CapCareful
+	a.UseFirst = pk.UseFirst
 	a.AccountNames = pk.AccountNames
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.MaxAccounts = pk.MaxAccounts
@@ -1010,6 +1099,12 @@ func accountSettings(a, pk Provider) Provider {
 func Hidden() []Provider {
 	var out []Provider
 	saved := storedFile().Providers
+	// most users removed none: then no account is made at all (Accounts
+	// reads every sign-in, ~0.6 MB each poll of the Providers page,
+	// which asks twice, here and through Excluded)
+	if !slices.ContainsFunc(saved, func(p Provider) bool { return p.Hidden }) {
+		return nil
+	}
 	for _, a := range Accounts() {
 		for _, p := range saved {
 			if p.ID == a.ID && p.Hidden {
@@ -1082,7 +1177,7 @@ func readElsewhere() string {
 	return fmt.Sprintf("\n  this magpie reads its files from %s, as XDG_CONFIG_HOME says; the app opened from the Dock or Start menu keeps them in %s. Run it with XDG_CONFIG_HOME unset (env -u XDG_CONFIG_HOME magpie …) to use those", appdir.Config(), def)
 }
 
-var idRe = regexp.MustCompile(`[^a-z0-9]+`)
+var idRe = lazyre.New(`[^a-z0-9]+`)
 
 // Slug derives an id from a name: "My Relay" → "my-relay".
 func Slug(name string) string {
@@ -1162,6 +1257,21 @@ func Save(p Provider) error {
 		}
 		if p.HTTP1 && !p.TakesInsecureTLS() {
 			return fmt.Errorf("%s is a preset's: only a provider you added with your own base URL can be held to HTTP/1.1", p.Name)
+		}
+		if p.ClientCert != "" || p.ClientKey != "" || p.ServerCA != "" {
+			if !p.TakesClientCert() {
+				return fmt.Errorf("%s: a client certificate or server CA is only for a provider you added with a base URL of its own, or Remote magpie", p.ID)
+			}
+			for _, f := range []*string{&p.ClientCert, &p.ClientKey, &p.ServerCA} {
+				v, err := CertPath(*f)
+				if err != nil {
+					return fmt.Errorf("%s: %w", p.ID, err)
+				}
+				*f = v
+			}
+			if err := netproxy.CheckClientCert(p.ClientCert, p.ClientKey, p.ServerCA); err != nil {
+				return fmt.Errorf("%s: %w", p.ID, err)
+			}
 		}
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
@@ -1398,7 +1508,10 @@ func AddCopy(p Provider, from string) (string, error) {
 	p.Unredacted = p.Unredacted || src.Unredacted
 	p.CountFree = p.CountFree || src.CountFree
 	p.NativeCompaction = p.NativeCompaction || src.NativeCompaction
-	p.PassUserAgent = p.PassUserAgent || src.PassUserAgent
+	if p.Socket == "" {
+		p.Socket = src.Socket
+	}
+	p.MagpieUserAgent = p.MagpieUserAgent || src.MagpieUserAgent
 	if p.Website == "" {
 		p.Website = src.Website
 	}
@@ -1628,6 +1741,11 @@ func normalize(p Provider) Provider {
 		p.Patience = PatienceOff
 	}
 	p.Patience = min(p.Patience, PatienceLongest)
+	if v, ok := ParseSocket(p.Socket); ok {
+		p.Socket = v
+	} else {
+		p.Socket = ""
+	}
 	p.Key = strings.TrimSpace(p.Key)
 	p.Proxy = strings.TrimSpace(p.Proxy)
 	p.AccountProxies = normalAccountProxies(p.AccountProxies)
@@ -1635,8 +1753,10 @@ func normalize(p Provider) Provider {
 	p.AccountModelsAll = normalModelsAll(p.AccountModelsAll, p.AccountModels)
 	p.AccountCaps = normalAccountCaps(p.AccountCaps)
 	p.AccountWindowCaps = normalWindowCaps(p.AccountWindowCaps)
+	p.AccountWindowAmounts = normalWindowAmounts(p.AccountWindowAmounts)
 	p.AccountNames = normalAccountNames(p.AccountNames)
 	p.KeySpendCaps = normalKeySpendCaps(p.KeySpendCaps)
+	p.KeyOwnBalances = normalKeyOwnBalances(p.KeyOwnBalances)
 	if len(p.Models) > 0 {
 		p.NoModels = false // a pick is no longer Select none
 	}
@@ -1711,6 +1831,13 @@ func normalize(p Provider) Provider {
 	// completions are, at whatever address it was given
 	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset || p.Preset == "ollama" || p.Preset == "ollama-cloud") && p.Decide == "" && p.Chat != "" {
 		p.Decide = p.Chat
+	}
+	// one asked at Volcengine Ark's pay as you go, its preset's or a
+	// custom one of either protocol, answers System One on the same key:
+	// its decision model is offered with no URL to type (a user on
+	// Discord found no System One endpoint for Ark, custom or preset)
+	if p.Decide == "" {
+		p.Decide = p.arkSystemOne()
 	}
 	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && p.Routing != FreeFirst && p.Routing != Fastest && p.Routing != Drain && !PluginRouting(p.Routing) {
 		p.Routing = ""

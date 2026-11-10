@@ -143,16 +143,12 @@
     return g > 0 ? Math.floor(free / g) : null;
   }
 
-  // count words a number with the phrase for one, or for many
   const count = (n, one, many) => n === 1 ? t(one) : t(many, { n });
 
-  // spark draws a session's prompts, request by request, against its
-  // window; the one the card tells of is marked, and a point clicked opens
-  // its request
+  // a session's prompts against its window; a point opens its request
   function spark(series, at, window, onPoint) {
     const W = 240, H = 34, pad = 3;
-    // scaled to the session's peak, so a session that never came near its
-    // window still shows how it grew; the window's line shows once it is near
+    // scaled to its peak; the window's line shows once it is near
     const peak = Math.max(...series.map((p) => p.tokens), 1);
     const top = window && peak > window * 0.6 ? Math.max(window, peak) : peak * 1.2;
     const x = (i) => series.length < 2 ? W / 2 : pad + (i / (series.length - 1)) * (W - pad * 2);
@@ -186,7 +182,9 @@
       if (!onPoint) return;
       const hit = ns("rect", { x: x(i) - Math.max(2, W / series.length / 2), y: 0, width: Math.max(4, W / series.length), height: H, class: "hit" + (on ? " on" : "") });
       const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
-      tip.textContent = t("Request {n}: {tokens} tokens", { n: i + 1, tokens: fmtK(p.tokens) });
+      const w = p.window || window;
+      tip.textContent = w ? t("Request {n}: {tokens} of {window} ({pct})", { n: i + 1, tokens: fmtK(p.tokens), window: fmtK(w), pct: pct(p.tokens / w) })
+        : t("Request {n}: {tokens} tokens", { n: i + 1, tokens: fmtK(p.tokens) });
       hit.append(tip);
       hit.onclick = (e) => { e.stopPropagation(); onPoint(p); };
     });
@@ -613,14 +611,14 @@
         n.style.height = `max(0px, calc(${pc(tl.h, H)}% - 3px))`;
         if (quiet || !n.animate || !(fresh || enter)) return;
         n.animate([{ opacity: 0, transform: "scale(.94)", filter: "blur(4px)" }, { opacity: 1, transform: "none", filter: "none" }],
-          { duration: 560, easing: IOS_EASE, delay: enter ? 40 + Math.min(i, 16) * 32 : 0, fill: "backwards" });
+          { duration: 380, easing: IOS_EASE, delay: enter ? 30 + Math.min(i, 16) * 20 : 0, fill: "backwards" });
       });
       for (const [k, n] of tiles) {
         if (seen.has(k)) continue;
         tiles.delete(k);
         n.classList.add("gone");
         if (quiet || !n.animate) { n.remove(); continue; }
-        n.animate([{ opacity: 1 }, { opacity: 0, transform: "scale(.96)" }], { duration: 260, easing: IOS_EASE, fill: "forwards" })
+        n.animate([{ opacity: 1 }, { opacity: 0, transform: "scale(.96)" }], { duration: 180, easing: IOS_EASE, fill: "forwards" })
           .finished.then(() => n.remove(), () => n.remove());
       }
     };
@@ -653,7 +651,7 @@
       const h1 = viz.offsetHeight;
       if (h0 !== h1) {
         viz.style.overflow = "hidden";
-        viz.animate([{ height: h0 + "px" }, { height: h1 + "px" }], { duration: 520, easing: IOS_EASE })
+        viz.animate([{ height: h0 + "px" }, { height: h1 + "px" }], { duration: 340, easing: IOS_EASE })
           .finished.finally(() => { viz.style.overflow = ""; }).catch(() => {});
       }
     };
@@ -1159,6 +1157,8 @@
     return box;
   }
 
+  window.ctxSpark = spark;
+  window.ctxHealth = health;
 
   // ---------- tuned for you: the settings that would have spent the fewest tokens ----------
 
@@ -1308,12 +1308,7 @@
       ? chart(a.compact.curve || [], r.current, r.best, show, timed)
       : chart([{ value: "5m", cost: r.short }, { value: "1h", cost: r.hour }], r.current, r.best, show);
     if (c) row.append(c);
-    // the leanest band: the windows within 3% of the cheapest on the curve,
-    // the share tune counts as costing the same. Timed, the advice keeps a
-    // window that waits no longer than now, so a window the reader picked
-    // past the band (yapechan on Discord: a larger one) comes back as the
-    // advice and isn't the leanest; it says so, names the band, and offers
-    // the band's largest window, the one of them that compacts least
+    // the leanest band: within 3% of the cheapest (yapechan on Discord)
     const curve = (a.compact && a.compact.curve) || [];
     const fewest = curve.length ? Math.min(...curve.map((p) => p.cost)) : 0;
     const band = curve.filter((p) => p.cost <= fewest * 1.03);
@@ -1404,10 +1399,7 @@
     // an hour no Undo puts back, too few calls to weigh (linkaww)
     if (a.few && ttl && cur === "1h" && !held && !set.ours) use("5m", yours);
     if (lean && !held) use(lean.value, yours || t("Fewer tokens, but more compactions to wait on"));
-    // a window of the reader's own (#1860), from the same replay: each
-    // value's tokens against the setting now, which the reader picks away
-    // from (hayden4608 on Discord: against the leanest, every line read as
-    // more), and compactions, both estimates
+    // a window of the reader's own (#1860), against the setting now (hayden4608)
     const pts = (a.compact && a.compact.curve) || [];
     if (pts.length > 1 && !held) {
       const other = el("button", "text ctx-tune-pick", t("Other window…"));
@@ -1480,6 +1472,8 @@
   }
 
   function renderTune(pane) {
+    // gateway mode: the agents and their files are on other computers
+    if (tuneData?.gateway || !tuneData && gatewayMode) return;
     const head = el("div", "row-head ctx-sess-head");
     head.append(el("span", "label", t("Tuned for you")), el("span", "grow"));
     pane.append(head);
@@ -1498,6 +1492,10 @@
     pane.append(grid);
   }
 
+  // what this page can draw: another version's reply can hold other rows
+  // (Linka on Discord: a page from before few rows threw on one, "r.cost")
+  const obj = (r) => !!r && typeof r == "object", objs = (l) => Array.isArray(l) ? l.filter(obj) : [];
+
   async function loadTune(force) {
     const read = ++tuneRead, days = ctxDays;
     if (tuneData && tuneData.days !== +days) tuneData = null;
@@ -1505,7 +1503,7 @@
     if (read !== tuneRead) return;
     const json = JSON.stringify(data);
     if (!force && tuneData && json === tuneJSON) return;
-    tuneData = { days: +data.days || +days, agents: (data.agents || []).map((a) => ({ ...a, advice: a.advice || [] })) }, tuneJSON = json;
+    tuneData = { days: +data.days || +days, gateway: !!data?.gateway, agents: objs(data?.agents).map((a) => ({ ...a, advice: objs(a.advice).filter((r) => obj(r.compact) || obj(r.ttl) || r.few).map((r) => ({ ...r, setting: obj(r.setting) ? r.setting : {} })) })) }, tuneJSON = json;
     renderContext();
   }
 

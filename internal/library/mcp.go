@@ -8,8 +8,9 @@ import (
 	"io/fs"
 	"maps"
 	"math"
+	"os"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -26,6 +27,7 @@ import (
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
+	"github.com/yetone/magpie/internal/lazyre"
 )
 
 // Server is one MCP server: a command magpie's agents start, or a URL they
@@ -62,6 +64,13 @@ type Server struct {
 	// gateway serves them at its URL, and the hub calls the plugin itself
 	// (plugin_tools.go)
 	Plugin string `json:"plugin,omitempty"`
+	// Hidden is a server turned off in the Library (ServerOn), or a
+	// plugin's whose tools were hidden from every agent on the Plugins
+	// page (PluginServerOn, chengming0v0 on Discord): no agent is given
+	// it, nor a project, nor an app at the MCP router's address. Paused are the agents it had, given back when it is shown
+	// again. Both go once the server has an agent again (save).
+	Hidden bool     `json:"hidden,omitempty"`
+	Paused []string `json:"paused,omitempty"`
 	// Bridge is the Remote magpie (its provider id) whose MCP router the
 	// server is, given a server of its own (bridge_mcp.go)
 	Bridge string `json:"bridge,omitempty"`
@@ -128,6 +137,7 @@ func (s *Server) check() error {
 		if s.Command == "" {
 			return fmt.Errorf("%s: a command is needed", s.Name)
 		}
+		s.Command, s.Args = spacedProgram(s.Command, s.Args)
 		s.URL, s.Headers = "", nil
 	case "http", "sse":
 		if !strings.HasPrefix(s.URL, "http://") && !strings.HasPrefix(s.URL, "https://") {
@@ -178,6 +188,39 @@ func (s *Server) check() error {
 		}
 	}
 	return nil
+}
+
+// spacedProgram is a program by full path that has spaces in it, typed
+// as it is: "/Applications/Agent HUD.app/Contents/MacOS/Agent HUD --mcp"
+// (zachzhao1984 on Discord), or C:\Program Files\… on Windows, which a
+// command line split at each space makes /Applications/Agent and three
+// arguments, a program that isn't there. When cmd is a full path to no
+// file and cmd with the words after it, joined back by a space, is a
+// program on this computer, that is the program and the rest are its
+// arguments: the fewest words that make one, as Windows reads an unquoted
+// path. A command that is there, a bare name, or a path no join makes a
+// program are left as typed.
+func spacedProgram(cmd string, args []string) (string, []string) {
+	if len(args) == 0 || !filepath.IsAbs(cmd) || program(cmd) {
+		return cmd, args
+	}
+	p := cmd
+	for i, a := range args {
+		p += " " + a
+		if program(p) {
+			return p, slices.Clone(args[i+1:])
+		}
+	}
+	return cmd, args
+}
+
+// program is whether path is a file this computer can run.
+func program(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	return runtime.GOOS == "windows" || fi.Mode().Perm()&0o111 != 0
 }
 
 // same reports whether two definitions start the same server; which agents
@@ -311,7 +354,7 @@ func (f *mcpFile) supports(s *Server) error {
 
 // windowsPath is a program named as Windows names one: C:/…, a path with a
 // backslash in it, or …/npx.cmd.
-var windowsPath = regexp.MustCompile(`^[A-Za-z]:[\\/]|\\|(?i)\.(?:exe|cmd|bat|ps1)$`)
+var windowsPath = lazyre.New(`^[A-Za-z]:[\\/]|\\|(?i)\.(?:exe|cmd|bat|ps1)$`)
 
 // foreign says why an entry by the server's name that magpie can't read as
 // a server is one it mustn't write over, or nil: Zed's server from an
@@ -1085,7 +1128,8 @@ func (f *mcpFile) parseEntries(raw []byte) (map[string]map[string]any, error) {
 	var err error
 	switch f.Format {
 	case fmtCodex, fmtGrok:
-		err = toml.Unmarshal(raw, &doc)
+		// only the servers' tables are read: not Codex's thousands of projects
+		err = toml.Unmarshal(edit.TOMLWithout(raw, "projects"), &doc)
 	case fmtGoose, fmtHermes:
 		err = yaml.Unmarshal(raw, &doc)
 	default:

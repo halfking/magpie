@@ -1,6 +1,7 @@
 package sessions
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,7 +31,7 @@ func dshSessionFile(t *testing.T, lines []string) *state {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return parseDsh(file{agent: "dsh", path: p, main: true, size: st.Size(), mod: st.ModTime()}, nil)
+	return parseDsh(file{agent: "dsh", path: p, main: true, size: st.Size(), mod: modOf(st.ModTime())}, nil)
 }
 
 func TestDshResponseIDsSkipTheSeed(t *testing.T) {
@@ -43,8 +44,8 @@ func TestDshResponseIDsSkipTheSeed(t *testing.T) {
 		dshReplyWithID(4, "own-1"),
 		dshReplyWithID(5, "own-2"),
 	})
-	if want := []string{"own-1", "own-2"}; !slices.Equal(s.ResponseIDs, want) {
-		t.Fatalf("fork's own replies: %v, want %v", s.ResponseIDs, want)
+	if want := []string{"own-1", "own-2"}; !slices.Equal(s.more().ResponseIDs, want) {
+		t.Fatalf("fork's own replies: %v, want %v", s.more().ResponseIDs, want)
 	}
 }
 
@@ -58,8 +59,8 @@ func TestDshResponseIDsSkipTheSeedLength(t *testing.T) {
 		dshReplyWithID(1, "inherited-2"),
 		dshReplyWithID(2, "own"),
 	})
-	if want := []string{"own"}; !slices.Equal(s.ResponseIDs, want) {
-		t.Fatalf("fork's own replies: %v, want %v", s.ResponseIDs, want)
+	if want := []string{"own"}; !slices.Equal(s.more().ResponseIDs, want) {
+		t.Fatalf("fork's own replies: %v, want %v", s.more().ResponseIDs, want)
 	}
 }
 
@@ -71,8 +72,8 @@ func TestDshResponseIDsOfASession(t *testing.T) {
 		dshReplyWithID(1, "a"),
 		dshReplyWithID(2, "b"),
 	})
-	if want := []string{"a", "b"}; !slices.Equal(s.ResponseIDs, want) {
-		t.Fatalf("replies: %v, want %v", s.ResponseIDs, want)
+	if want := []string{"a", "b"}; !slices.Equal(s.more().ResponseIDs, want) {
+		t.Fatalf("replies: %v, want %v", s.more().ResponseIDs, want)
 	}
 }
 
@@ -85,8 +86,8 @@ func TestDshResponseIDsOnlyFromTheGateway(t *testing.T) {
 		`{"type":"assistant/message","seq":1,"time":1000,"data":{"message":{"source":{"provider":"deepseek","model":"deepseek-v4","replayState":{"response":{"provider":"deepseek","responseId":"vendor-1"}}}}}}`,
 		dshReplyWithID(2, "gw-1"),
 	})
-	if want := []string{"gw-1"}; !slices.Equal(s.ResponseIDs, want) {
-		t.Fatalf("replies: %v, want %v", s.ResponseIDs, want)
+	if want := []string{"gw-1"}; !slices.Equal(s.more().ResponseIDs, want) {
+		t.Fatalf("replies: %v, want %v", s.more().ResponseIDs, want)
 	}
 }
 
@@ -114,17 +115,17 @@ func TestDshResponseIDsEndSeedAcrossReads(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return file{agent: "dsh", path: p, main: true, size: st.Size(), mod: st.ModTime()}
+		return file{agent: "dsh", path: p, main: true, size: st.Size(), mod: modOf(st.ModTime())}
 	}
 	write(head, dshReplyWithID(1, "inherited"))
 	first := parseDsh(f(), nil)
-	if len(first.ResponseIDs) != 1 {
-		t.Fatalf("before the marker: %v", first.ResponseIDs)
+	if len(first.more().ResponseIDs) != 1 {
+		t.Fatalf("before the marker: %v", first.more().ResponseIDs)
 	}
 	write(`{"type":"session/end-seed","seq":2,"time":1000,"data":{"inherited":true}}`, dshReplyWithID(3, "own"))
 	next := parseDsh(f(), first)
-	if want := []string{"own"}; !slices.Equal(next.ResponseIDs, want) {
-		t.Fatalf("after the marker: %v, want %v", next.ResponseIDs, want)
+	if want := []string{"own"}; !slices.Equal(next.more().ResponseIDs, want) {
+		t.Fatalf("after the marker: %v, want %v", next.more().ResponseIDs, want)
 	}
 }
 
@@ -185,5 +186,31 @@ func TestDshForkOfARealSessionListsItsOwnReplies(t *testing.T) {
 	}
 	if byID[source].ForkOf != "" {
 		t.Errorf("the source is forked from %q", byID[source].ForkOf)
+	}
+}
+
+// dsh writes no parentSession for a fork it makes today (0.2.2): the
+// openings its seed carried are the only record that it came from the
+// session it copied, and are kept when the seed's end takes them off Convs.
+func TestDshForkWithoutAParentKeepsItsSeedOpenings(t *testing.T) {
+	head := `{"type":"session","version":4,"id":"session-child","cwd":"/w","createdAt":1000,"delegationDepth":0,"isSeeded":true}`
+	s := dshSessionFile(t, []string{
+		head,
+		`{"type":"user/message","seq":1,"time":1000,"data":{"source":{"kind":"user"},"content":[{"type":"text","text":"same first prompt"}]}}`,
+		`{"type":"session/end-seed","seq":2,"time":1000,"data":{"inherited":true}}`,
+		dshReplyWithID(3, "own"),
+	})
+	want := dshConvs(json.RawMessage(`[{"type":"text","text":"same first prompt"}]`))
+	if len(want) == 0 {
+		t.Fatal("the fixture opens no conversation")
+	}
+	if !slices.Equal(s.more().SeedConvs, want) {
+		t.Fatalf("seed openings %v, want %v", s.more().SeedConvs, want)
+	}
+	if len(s.more().Convs) != 0 {
+		t.Fatalf("the fork keeps its source's opening as its own: %v", s.more().Convs)
+	}
+	if !slices.Equal(s.more().ResponseIDs, []string{"own"}) {
+		t.Fatalf("replies %v, want [own]", s.more().ResponseIDs)
 	}
 }

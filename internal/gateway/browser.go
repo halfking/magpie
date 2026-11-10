@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -103,7 +104,10 @@ type browserConn struct {
 	// calls (their pages read, and pages of theirs fed back).
 	own   bool
 	since time.Time
-	wmu   sync.Mutex
+	// told: an agent was told this extension is older than magpie's
+	// (browserOlder), once a connection
+	told atomic.Bool
+	wmu  sync.Mutex
 }
 
 // browserName is the browser a User-Agent names, with its major version:
@@ -415,10 +419,14 @@ func browserExtensionKey(r *http.Request) (access.Identity, bool) {
 var browserKeyCheck = 5 * time.Second
 
 // watchKey closes c's connection once the key it connected with is no
-// longer Current: turned off, removed, expired or rotated. A browser
-// call looks too (call), so none is handed to it in between.
-func (c *browserConn) watchKey(ctx context.Context) {
-	t := time.NewTicker(browserKeyCheck)
+// longer Current: turned off, removed, expired or rotated, looking every
+// each. A browser call looks too (call), so none is handed to it in
+// between. each is browserKeyCheck as the connection was taken, read
+// there and not on this goroutine: a test that sets browserKeyCheck once
+// a browser has connected is ordered after that read, never beside it
+// (#5569).
+func (c *browserConn) watchKey(ctx context.Context, each time.Duration) {
+	t := time.NewTicker(each)
 	defer t.Stop()
 	for {
 		select {
@@ -459,7 +467,7 @@ func (s *Server) browserExtension(w http.ResponseWriter, r *http.Request) {
 	if key != "" {
 		watch, stop := context.WithCancel(ctx)
 		defer stop()
-		go c.watchKey(watch)
+		go c.watchKey(watch, browserKeyCheck)
 	}
 	added := false
 	defer func() {
@@ -568,7 +576,8 @@ func (s *Server) browserMCPCall(r *http.Request, m mcpMessage) (any, map[string]
 			}
 			json.Unmarshal(p.Arguments, &acted)
 			if tool == browserRecordTool {
-				return s.browserRecord(r, browserSession(r), acted["action"] == "record_stop"), nil
+				format, _ := acted["format"].(string)
+				return s.browserRecord(r, browserSession(r), acted["action"] == "record_stop", format), nil
 			}
 			p.Name, p.Arguments, shot = tool, args, wants
 		} else if !browserToolNamed(p.Name) {
@@ -629,9 +638,28 @@ func (s *Server) browserMCPCall(r *http.Request, m mcpMessage) (any, map[string]
 				}
 			}
 		}
-		return said(result), nil
+		return s.browserOlder(session, said(result)), nil
 	}
 	return nil, map[string]any{"code": -32601, "message": "method not found: " + m.Method}
+}
+
+// browserOlder puts a word before result, once a connection, when the
+// extension is older than this magpie's: its folder has the new one, but
+// the browser runs what it loaded until the extension is reloaded or the
+// browser starts again, so the agent tells the user.
+func (s *Server) browserOlder(session string, result map[string]any) map[string]any {
+	c := s.browser.forSession(session)
+	if c == nil || !browserext.Older(c.version, browserext.Version()) || !c.told.CompareAndSwap(false, true) {
+		return result
+	}
+	how := "it is reloaded on chrome://extensions (edge://extensions in Edge): magpie has put the new one in its folder already"
+	if c.key != "" {
+		how = "it is downloaded again from magpie's Library → Magpie Browser, unzipped over the old folder and reloaded on chrome://extensions (edge://extensions in Edge)"
+	}
+	note := fmt.Sprintf("Tell the user: Magpie Browser in their browser is %s and magpie has %s, which the browser doesn't run until %s.", c.version, browserext.Version(), how)
+	content, _ := result["content"].([]any)
+	result["content"] = append([]any{map[string]any{"type": "text", "text": note}}, content...)
+	return result
 }
 
 // browserPicture is a picture of session's window (base64), or why there

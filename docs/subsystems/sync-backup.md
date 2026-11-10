@@ -125,7 +125,14 @@ Each operation holds the sync lock, so configuration changes cannot race a
 sync's state write.
 
 A first computer creates a remote backup. Another computer joining takes
-the remote setup and keeps displaced local parts in its sync folder.
+the remote setup and keeps displaced local parts in its sync folder. A
+part the file holds nothing of its own in (`unset`: no providers or
+routing groups, the default settings, no profiles, an empty library) is
+the folder never having had one, not a removal: on a join, a computer
+with that part set up keeps it and sends it up (#5642: an empty computer
+that synced first emptied the next one's providers and groups). After the
+join an emptied part is a removal and spreads as before
+(`TestSyncEmptyFirstKeepsLaterSetups`).
 Subsequent syncs compare each part with the hashes from the previous sync:
 local-only changes go up, remote-only changes come down, and a part changed
 on both sides keeps the newer version while retaining the replaced copy.
@@ -188,15 +195,65 @@ clock.
   reveal,restore}`. `set` changes only the fields sent; `dir ""` is the
   default folder. Settings draws it under Sync's Export and Import from the
   lazy [`autobackup.js`](../../internal/gui/assets/autobackup.js).
-  The status's `inside` says the folder is `settings.Dir()` or in it (letter
+  Its Versions row says how many and the newest (a state, kept in sight
+  where Settings' hints rest out of it) and folds the versions, each with
+  Restore…, until its name or that line is clicked; the fold is kept over
+  redraws for the window's life (chen2652 on Discord,
+  `auto-backup.test.cjs`). The status's `inside` says the folder is `settings.Dir()` or in it (letter
   case aside off Linux), the default included; Settings then says under the
   folder that a reinstalled system or a lost disk takes the backups too, and
   to pick one on another disk or a cloud drive's (two_2025. on Discord,
-  magpie on C:). Keeping everything elsewhere is portable mode
-  (`internal/appdir`); docs/start's `#data-folder` gives both
-  (`TestAutoInsideMagpiesFolder`, `auto-backup.test.cjs`).
+  magpie on C:). Keeping everything elsewhere is the Data folder's move
+  (below) or portable mode (`internal/appdir`); docs/start's
+  `#data-folder` gives all three (`TestAutoInsideMagpiesFolder`,
+  `auto-backup.test.cjs`).
 - **Sign-ins:** off unless picked (`SignIns`, with `Passphrase`); see
   [Sign-ins, when picked](#sign-ins-when-picked).
+
+## Data folder on another disk
+
+Settings › Sync's Data folder (CHENGJIAHEGOXIS and buhaodeshiyehao on X)
+moves magpie's own files and cache to another disk, and back.
+[`internal/appdir/move.go`](../../internal/appdir/move.go) does it:
+
+- **What moves:** `appdir.Config()` and `appdir.Cache()` only, into
+  `<picked>/magpie/config` and `<picked>/magpie/cache`. The agents' own
+  folders (`~/.claude`, `~/.codex`…) and their session histories stay where
+  each agent reads them. A link is left at each old path (a symlink, or a
+  junction on Windows when symlinks need a privilege, as in #973), so every
+  path magpie and the agents were given still works. A portable magpie is
+  never moved.
+- **Refused before anything quits** (`Target`): a relative path, a folder
+  that isn't there, a `magpie` folder there with files in it, or a folder
+  inside magpie's own folders.
+- **Never under a running magpie.** `AskMove` writes `move-to.json` in the
+  config folder. The GUI then starts itself again (`restartSelf`, the
+  update path's relaunch) and quits; when another magpie serves the gateway
+  (`magpie serve`, a launch agent), or for magpie web, it doesn't restart,
+  and the row says the move waits. The next start runs `MovePending` in
+  `cli.Main` before anything reads a file, after the old process is gone
+  and only when no gateway answers. It is made once: a failure is not asked
+  for again, and why is kept in `move-result.json` for the row.
+- **How:** within one disk, a rename. Across disks, a copy, and the old
+  folder is put aside (`.moved`) until the link is made, then removed; a
+  failed copy removes the half copy and leaves the old folder as it was.
+  Moving back takes the link away and renames the folder home; across
+  disks it puts the link back, copies to `<config>.moving` and renames that
+  into place. The empty `magpie` folder on the disk is then removed. The
+  config moves first: a cache that fails after it says so and leaves the
+  config moved.
+- **Disk gone:** a link that leads nowhere is `UnreachableError`. `cli.Main`
+  stops on it, with a native alert from the app (as #989), rather than
+  starting an empty magpie that would write a new config over the link.
+- **CLI:** `magpie data` says where they are; `magpie data move <folder>`
+  moves at once with no gateway up, otherwise asks for it;
+  `magpie data move --home` and `magpie data cancel`.
+
+Routes: `GET /api/datafolder`, `POST /api/datafolder/{move,home,cancel,reveal}`
+([`datafolder.go`](../../internal/gui/datafolder.go)). Tests:
+`internal/appdir/move_test.go` (both disks, refused targets, a failed copy,
+disk gone, once only), `move_windows_test.go` (the junction),
+`TestDataFolderMoveRestarts` and `data-folder.test.cjs`.
 
 ## Sign-ins, when picked
 
@@ -218,6 +275,16 @@ switch that anyone with the file and the passphrase can use those accounts.
   Each record has an id that names the account (agent, lower-case email and
   organisation; or the account key), its time of renewal and a hash; ids two
   rows share are left out on both sides, as no one can tell which is which.
+- **Never carried:** a plugin's sign-in whose vendor spends a refresh
+  token once. Two computers holding one copy race to renew it, and the
+  vendor turns the loser away for good with no newer copy anywhere
+  (#5583, skalitz-wolf). Such a plugin says so with its auth hook's
+  `rotating` (`Provider.Rotating`); MiniMax Code and Qoder are known to
+  (`rotatesKnown`). `CollectSignIns` leaves them out, and `records` leaves
+  out one an older file carried, so a sync neither sends nor takes one
+  and a Restore writes none. Each computer signs in to them itself
+  (`TestCollectSignInsLeavesARotatingSignInOut`,
+  `TestKnownRotatingSignInsStayWithNoPluginListed`).
 - **Sealed:** a backup or export seals them with the rest of the file. An
   automatic backup, which has no passphrase on a schedule, seals them
   alone (`SealData`) with the passphrase asked for as they are turned on,

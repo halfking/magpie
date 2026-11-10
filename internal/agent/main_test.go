@@ -47,6 +47,14 @@ func TestMain(m *testing.M) {
 	// nor where this Mac's Spotlight has an app (DeepSeek Harness.app
 	// outside /Applications, #2325)
 	spotlightApps = func(string) []string { return nil }
+	// whether OpenMausBot is open is never this machine's: one open there
+	// refused every test that turns magpie on for each agent; the tests
+	// about it say their own
+	ombRunning = func() bool { return false }
+	// nor which OpenCode this machine has: an OpenCode 2 on PATH turned
+	// every OpenCode test's file into OpenCode 2's words; the tests about
+	// it say their own (opencode_v2_test.go)
+	openCodeVersion = func() string { return "" }
 	// a desktop app's Restart never quits or opens one of this machine's
 	// (the Codex app, Claude Desktop, WorkBuddy the developer runs); the
 	// restart tests stand in for each step

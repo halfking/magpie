@@ -27,7 +27,7 @@ import (
 // Install routes http.DefaultTransport (and so http.DefaultClient) through
 // Func, and http.DefaultClient's requests made on a provider's behalf
 // (With) through a transport of that provider's proxy (Dispatch). Its
-// HTTP/2 connections are checked as the gateway's are (HTTP2Health), and
+// HTTP/2 connections are checked by Go's own pings (HTTP2Health), and
 // the requests magpie sends on its own are written down (probelog).
 func Install() {
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
@@ -61,7 +61,10 @@ var PingAfter, PingWait = 10 * time.Second, 10 * time.Second
 // (#2843). A ping finds it, and the requests on it fail, so a group moves
 // on and the next request dials anew. A live vendor answers a ping
 // whatever its streams are doing, so a long wait for a first byte is
-// never cut by it.
+// never cut by it. But a ping's answer restarts the clock, so a wait of
+// minutes is pinged every PingAfter, which Google's front end ends the
+// connection for: the gateway's transports ping by CalmHTTP2 instead, and
+// this is for http.DefaultTransport's short requests.
 func HTTP2Health() *http.HTTP2Config {
 	return &http.HTTP2Config{SendPingTimeout: PingAfter, PingTimeout: PingWait}
 }
@@ -119,12 +122,16 @@ func Held(ctx context.Context) error {
 // "direct", #1522) goes through its own provider's proxy, never the one
 // it was made under. A provider's leave not to check its certificate
 // (WithUncheckedTLS) goes the same way: it is the outer provider's, and
-// dropped here, and so is its ask for HTTP/1.1 (WithHTTP1).
+// dropped here, and so is its ask for HTTP/1.1 (WithHTTP1) and its own
+// TLS identity (WithClientCert).
 func With(ctx context.Context, choice string) context.Context {
-	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" && uncheckedOf(ctx) == nil && http1Of(ctx) == nil {
+	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" && uncheckedOf(ctx) == nil && http1Of(ctx) == nil && clientCertOf(ctx) == nil {
 		return ctx
 	}
 	ctx = context.WithValue(ctx, choiceKey{}, choice)
+	if clientCertOf(ctx) != nil {
+		ctx = context.WithValue(ctx, clientCertKey{}, (*clientCert)(nil))
+	}
 	if uncheckedOf(ctx) != nil {
 		ctx = context.WithValue(ctx, uncheckedKey{}, map[string]bool(nil))
 	}
@@ -133,6 +140,24 @@ func With(ctx context.Context, choice string) context.Context {
 	}
 	return ctx
 }
+
+// Downloads is ctx for magpie's downloads of plugins — the plugins list,
+// npm's registry, GitHub, the plugins repo's dist branch, Bun itself —
+// which go through the proxy Settings sets for them (PluginProxy) when it
+// names one (JonahFu on X: GitHub reached only through a proxy, the
+// vendors without). Its "" leaves ctx as it is, so they follow the
+// global proxy as every other request does.
+func Downloads(ctx context.Context) context.Context {
+	if c := strings.TrimSpace(settings.Load().PluginProxy); c != "" {
+		return With(ctx, c)
+	}
+	return ctx
+}
+
+// EnvDownloads is Env for a program magpie starts to download plugins
+// (bun add and update, git): plugin downloads' proxy (Downloads), or,
+// when that names none, Env's.
+func EnvDownloads(env []string) []string { return EnvWith(settings.Load().PluginProxy, env) }
 
 // Choice is the proxy ctx names (With), "" when it names none — for a CLI
 // run on a provider's behalf, whose *_PROXY is set from it (EnvWith).
@@ -174,7 +199,8 @@ var HTTP1 func(u *url.URL) bool
 // connection carried a TLS record that didn't decrypt (recordError, for h2Broken after) go
 // through a clone kept for HTTP/1.1 (http1Only), and one to a host whose certificate the provider's user
 // said not to check (WithUncheckedTLS) through a clone kept for that
-// host alone (uncheckTLS). A host whose IPv6 is taken but goes nowhere
+// host alone (uncheckTLS), and one made with a provider's own TLS
+// identity (WithClientCert) through a clone kept for it (clientTLS). A host whose IPv6 is taken but goes nowhere
 // is dialed over IPv4 (v4Fallback).
 func Dispatch(base *http.Transport) http.RoundTripper {
 	v4Fallback(base)
@@ -198,13 +224,14 @@ type route struct {
 	choice    string
 	h1        bool
 	unchecked string
+	client    string // clientRoute
 }
 
 func (d *dispatch) RoundTrip(req *http.Request) (*http.Response, error) {
 	if d.moved() {
 		d.CloseIdleConnections()
 	}
-	r := route{choice: choiceOf(req.Context()), h1: HTTP1 != nil && HTTP1(req.URL) || http1Asked(req) || overHTTP1(req.Context()) || h2BrokenFor(req), unchecked: uncheckedHost(req)}
+	r := route{choice: choiceOf(req.Context()), h1: HTTP1 != nil && HTTP1(req.URL) || http1Asked(req) || overHTTP1(req.Context()) || h2BrokenFor(req), unchecked: uncheckedHost(req), client: clientRoute(req)}
 	t := d.base
 	if r != (route{}) {
 		t = d.transport(r)
@@ -281,6 +308,17 @@ func (d *dispatch) transport(r route) *http.Transport {
 	}
 	if r.unchecked != "" {
 		uncheckTLS(t)
+	}
+	if r.client != "" {
+		clientTLS(t, r.client)
+	}
+	if isCalm(d.base) {
+		// a clone shares base's HTTP/2 connections, dialled through
+		// base's proxy, until it is given its own
+		t.TLSNextProto = nil
+		if !r.h1 {
+			CalmHTTP2(t)
+		}
 	}
 	d.own[r] = t
 	return t

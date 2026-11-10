@@ -16,7 +16,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -25,6 +24,7 @@ import (
 	"time"
 	"unicode/utf16"
 
+	"github.com/yetone/magpie/internal/lazyre"
 	"github.com/yetone/magpie/internal/proc"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -49,7 +49,10 @@ var Run = func(timeout time.Duration, args ...string) ([]byte, error) {
 	defer cancel()
 	cmd := proc.CommandContext(ctx, "wsl.exe", args...)
 	cmd.Env = append(os.Environ(), "WSL_UTF8=1")
-	return cmd.Output()
+	out, err := cmd.Output()
+	// one that says WSL must be updated isn't run again for hours
+	proc.WSLSaid(out, err)
+	return out, err
 }
 
 var found struct {
@@ -124,7 +127,7 @@ var ErrNotFound = errors.New("not in the distro")
 
 // plainName is a command In can look for: the probe names it in a shell
 // script unquoted, so a name with anything else in it isn't looked for.
-var plainName = regexp.MustCompile(`^[A-Za-z0-9_./+@:-]+$`)
+var plainName = lazyre.New(`^[A-Za-z0-9_./+@:-]+$`)
 
 var foundIn struct {
 	sync.Mutex
@@ -203,7 +206,8 @@ func running() (names []string, ok bool) {
 	}
 	if up.at.IsZero() || time.Since(up.at) > age {
 		b, err := Run(10*time.Second, "-l", "--running", "-q")
-		up.names, up.ok, up.at = Distros(b), err == nil, time.Now()
+		// no distro registered at all is an answer: none runs
+		up.names, up.ok, up.at = Distros(b), err == nil || errors.Is(err, proc.ErrNoWSLDistro), time.Now()
 		if err != nil {
 			up.names = nil
 		}

@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -16,6 +15,8 @@ import (
 	"github.com/yetone/magpie/internal/agent"
 	"github.com/yetone/magpie/internal/gateway"
 	"github.com/yetone/magpie/internal/ghtoken"
+	"github.com/yetone/magpie/internal/lazyre"
+	"github.com/yetone/magpie/internal/library"
 	"github.com/yetone/magpie/internal/middleware"
 	"github.com/yetone/magpie/internal/plugin"
 	"github.com/yetone/magpie/internal/provider"
@@ -50,7 +51,7 @@ type pluginOptionJSON struct {
 }
 
 // pluginOptionKey is the key an option may have, as the host checks it.
-var pluginOptionKey = regexp.MustCompile(`^[a-z0-9_-]{1,40}$`)
+var pluginOptionKey = lazyre.New(`^[a-z0-9_-]{1,40}$`)
 
 // pluginIcon is the vendor's icon: the one the plugin gives its provider,
 // else the one the plugin market gives the plugin or its provider, else
@@ -171,6 +172,9 @@ type pluginEntryJSON struct {
 	// offers every agent under MCP's name: with their descriptions while
 	// the host runs, by name alone from what it noted last when it doesn't
 	Tools []pluginToolJSON `json:"tools,omitempty"`
+	// ToolsServer is the Library's server of those tools, whose agents
+	// the row turns them off and on for (chengming0v0 on Discord)
+	ToolsServer *library.PluginServer `json:"toolsServer,omitempty"`
 }
 
 // pluginToolJSON is one tool a plugin gives, as its row lists it.
@@ -272,6 +276,10 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 		}
 	}
 	toolNames := gateway.ToolNames(tools)
+	var servers map[string]library.PluginServer
+	if len(tools) > 0 {
+		servers = library.PluginServers()
+	}
 	// each plugin's subscriptions, by the names it gave last (plugin.Cached,
 	// which holds them without starting the host or asking anyone, and asks
 	// the plugins again in the background when a sign-in or the plugins
@@ -376,6 +384,9 @@ func pluginsState(ctx context.Context, w Windows) pluginsJSON {
 			}
 			for _, x := range pt.Tools {
 				j.Tools = append(j.Tools, pluginToolJSON{Name: x.Name, Description: x.Description, MCP: toolNames[e.Spec][x.Name]})
+			}
+			if sv, ok := servers[plugin.Name(e.Spec)]; ok && len(j.Tools) > 0 {
+				j.ToolsServer = &sv
 			}
 		}
 		j.Moved = provider.MovedOnto(e.Spec)
