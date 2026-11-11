@@ -3,7 +3,7 @@ package provider
 import (
 	"context"
 	"time"
-	
+
 	"github.com/yetone/magpie/internal/provider/balance/core"
 	"github.com/yetone/magpie/internal/provider/balance/providers"
 )
@@ -15,7 +15,7 @@ func init() {
 	// 初始化默认的 BalanceManager
 	config := core.DefaultManagerConfig()
 	defaultBalanceManager = core.NewBalanceManager(config)
-	
+
 	// 注册内置 providers
 	registerBuiltinProviders()
 }
@@ -24,7 +24,7 @@ func init() {
 func registerBuiltinProviders() {
 	// 注册 DeepSeek
 	_ = defaultBalanceManager.RegisterProvider(providers.NewDeepSeekProvider())
-	
+
 	// TODO: 注册其他 providers
 	// _ = defaultBalanceManager.RegisterProvider(providers.NewMoonshotProvider())
 	// _ = defaultBalanceManager.RegisterProvider(providers.NewOpenRouterProvider())
@@ -48,14 +48,14 @@ func BalanceV2(ctx context.Context, p Provider) (*core.BalanceResult, error) {
 		ResponsesEndpoint: p.Responses,
 		AnthropicEndpoint: p.Anthropic,
 	}
-	
+
 	return defaultBalanceManager.GetBalance(ctx, config)
 }
 
 // BalanceBatch 批量查询余额（新接口）
 func BalanceBatch(ctx context.Context, providers []Provider) (map[string]*core.BalanceResult, error) {
 	configs := make([]core.ProviderConfig, 0, len(providers))
-	
+
 	for _, p := range providers {
 		config := core.ProviderConfig{
 			ProviderID:        p.ID,
@@ -73,7 +73,7 @@ func BalanceBatch(ctx context.Context, providers []Provider) (map[string]*core.B
 		}
 		configs = append(configs, config)
 	}
-	
+
 	return defaultBalanceManager.GetBalanceBatch(ctx, configs)
 }
 

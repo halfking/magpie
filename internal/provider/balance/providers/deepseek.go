@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	
+
 	"github.com/yetone/magpie/internal/provider/balance/core"
 )
 
@@ -38,11 +38,11 @@ func (p *DeepSeekProvider) FetchBalance(ctx context.Context, config core.Provide
 	if err != nil {
 		return nil, fmt.Errorf("create request failed: %w", err)
 	}
-	
+
 	// 设置认证头
 	req.Header.Set("Authorization", "Bearer "+config.APIKey)
 	req.Header.Set("Accept", "application/json")
-	
+
 	// 发送请求
 	client := &http.Client{Timeout: config.Timeout}
 	resp, err := client.Do(req)
@@ -50,24 +50,24 @@ func (p *DeepSeekProvider) FetchBalance(ctx context.Context, config core.Provide
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// 读取响应
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 限制 1MB
 	if err != nil {
 		return nil, fmt.Errorf("read response failed: %w", err)
 	}
-	
+
 	// 检查状态码
 	if resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	// 解析响应
 	result, err := p.ParseResponse(body)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	result.RawResponse = body
 	return result, nil
 }
@@ -77,21 +77,21 @@ func (p *DeepSeekProvider) ParseResponse(body []byte) (*core.BalanceResult, erro
 	var resp struct {
 		IsAvailable  bool `json:"is_available"`
 		BalanceInfos []struct {
-			Currency       string      `json:"currency"`
-			TotalBalance   interface{} `json:"total_balance"`
-			GrantedBalance interface{} `json:"granted_balance"`
+			Currency        string      `json:"currency"`
+			TotalBalance    interface{} `json:"total_balance"`
+			GrantedBalance  interface{} `json:"granted_balance"`
 			ToppedUpBalance interface{} `json:"topped_up_balance"`
 		} `json:"balance_infos"`
 	}
-	
+
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, fmt.Errorf("parse JSON failed: %w", err)
 	}
-	
+
 	if len(resp.BalanceInfos) == 0 {
 		return nil, errors.New("no balance info in response")
 	}
-	
+
 	// 解析各币种余额
 	type balanceAmount struct {
 		currency string
@@ -100,19 +100,19 @@ func (p *DeepSeekProvider) ParseResponse(body []byte) (*core.BalanceResult, erro
 		topped   float64
 		hasSplit bool
 	}
-	
+
 	var amounts []balanceAmount
 	for _, info := range resp.BalanceInfos {
 		total, ok := parseNumber(info.TotalBalance)
 		if !ok {
 			continue
 		}
-		
+
 		amt := balanceAmount{
 			currency: strings.ToUpper(info.Currency),
 			total:    total,
 		}
-		
+
 		// 尝试解析拆分信息
 		granted, gok := parseNumber(info.GrantedBalance)
 		topped, tok := parseNumber(info.ToppedUpBalance)
@@ -121,26 +121,26 @@ func (p *DeepSeekProvider) ParseResponse(body []byte) (*core.BalanceResult, erro
 			amt.topped = topped
 			amt.hasSplit = true
 		}
-		
+
 		amounts = append(amounts, amt)
 	}
-	
+
 	if len(amounts) == 0 {
 		return nil, errors.New("no valid balance found")
 	}
-	
+
 	// 按优先级排序：有余额的在前，按币种代码排序
 	// 这里简化处理，实际应该更复杂
-	
+
 	// 构建显示金额
 	parts := make([]string, 0, len(amounts))
 	var allParts []core.BalancePart
 	var split []core.BalancePart
-	
+
 	for _, amt := range amounts {
 		sign := currencySign(amt.currency)
 		parts = append(parts, formatMoney(sign, amt.total))
-		
+
 		// 如果有拆分信息且赠送部分>0，添加到 split
 		if amt.hasSplit && amt.granted > 0 {
 			split = append(split,
@@ -155,7 +155,7 @@ func (p *DeepSeekProvider) ParseResponse(body []byte) (*core.BalanceResult, erro
 			)
 		}
 	}
-	
+
 	return &core.BalanceResult{
 		Amount:   strings.Join(parts, " · "),
 		Parts:    allParts,

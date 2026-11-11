@@ -34,24 +34,24 @@ type BalanceProvider interface {
 // ProviderConfig 包含 provider 的配置信息
 type ProviderConfig struct {
 	// 基础信息
-	ProviderID   string            // Provider ID
-	APIKey       string            // API Key
-	BalanceToken string            // 账户级别的 token（可选）
-	
+	ProviderID   string // Provider ID
+	APIKey       string // API Key
+	BalanceToken string // 账户级别的 token（可选）
+
 	// 自定义配置
 	BalanceURL    string            // 自定义余额查询 URL
 	BalancePath   string            // 自定义 JSONPath
 	BalanceMethod string            // HTTP 方法（GET/POST）
 	Headers       map[string]string // 自定义 Headers
-	
+
 	// 请求配置
-	Timeout      time.Duration     // 请求超时时间
-	EnableRetry  bool              // 是否启用重试
-	
+	Timeout     time.Duration // 请求超时时间
+	EnableRetry bool          // 是否启用重试
+
 	// 内部使用
-	ChatEndpoint      string        // Chat 端点（用于识别 host）
-	ResponsesEndpoint string        // Responses 端点
-	AnthropicEndpoint string        // Anthropic 端点
+	ChatEndpoint      string // Chat 端点（用于识别 host）
+	ResponsesEndpoint string // Responses 端点
+	AnthropicEndpoint string // Anthropic 端点
 }
 
 // BalanceResult 表示余额查询的完整结果
@@ -61,15 +61,15 @@ type BalanceResult struct {
 	Parts    []BalancePart `json:"parts"`    // 金额组成部分（用于多部分显示）
 	Split    []BalancePart `json:"split"`    // 余额拆分（如赠送/充值）
 	Currency string        `json:"currency"` // 币种代码（CNY/USD/等）
-	
+
 	// 限额窗口（用于限流控制）
 	Windows []QuotaWindow `json:"windows,omitempty"`
-	
+
 	// 元数据
-	IsShared  bool      `json:"is_shared"`  // 是否为账户级共享余额
-	Timestamp time.Time `json:"timestamp"`  // 查询时间
-	CacheKey  string    `json:"cache_key"`  // 缓存键
-	
+	IsShared  bool      `json:"is_shared"` // 是否为账户级共享余额
+	Timestamp time.Time `json:"timestamp"` // 查询时间
+	CacheKey  string    `json:"cache_key"` // 缓存键
+
 	// 原始响应（调试用）
 	RawResponse []byte `json:"-"`
 }
@@ -85,9 +85,9 @@ type BalancePart struct {
 
 // QuotaWindow 表示配额限制窗口
 type QuotaWindow struct {
-	Type   string  `json:"type"`   // 窗口类型（如 "5h", "week", "month"）
-	Limit  float64 `json:"limit"`  // 限额上限
-	Amount float64 `json:"amount"` // 已使用量
+	Type   string     `json:"type"`            // 窗口类型（如 "5h", "week", "month"）
+	Limit  float64    `json:"limit"`           // 限额上限
+	Amount float64    `json:"amount"`          // 已使用量
 	Reset  *time.Time `json:"reset,omitempty"` // 重置时间
 }
 
@@ -95,27 +95,27 @@ type QuotaWindow struct {
 type BalanceCache interface {
 	// Get 获取缓存的余额数据
 	Get(key string) (*BalanceResult, bool)
-	
+
 	// Set 设置缓存
 	Set(key string, result *BalanceResult, ttl time.Duration)
-	
+
 	// Delete 删除缓存
 	Delete(key string)
-	
+
 	// Clear 清空所有缓存
 	Clear()
-	
+
 	// Stats 返回缓存统计信息
 	Stats() CacheStats
 }
 
 // CacheStats 缓存统计信息
 type CacheStats struct {
-	Hits        int64 `json:"hits"`
-	Misses      int64 `json:"misses"`
-	Evictions   int64 `json:"evictions"`
-	Size        int   `json:"size"`
-	MaxSize     int   `json:"max_size"`
+	Hits      int64 `json:"hits"`
+	Misses    int64 `json:"misses"`
+	Evictions int64 `json:"evictions"`
+	Size      int   `json:"size"`
+	MaxSize   int   `json:"max_size"`
 }
 
 // BalanceMetrics 余额查询的监控指标
